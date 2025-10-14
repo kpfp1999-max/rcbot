@@ -28,8 +28,8 @@ console.log('Diag: GOOGLE_CLIENT_EMAIL present:', !!process.env.GOOGLE_CLIENT_EM
 console.log('Diag: GOOGLE_PRIVATE_KEY length:', (process.env.GOOGLE_PRIVATE_KEY||'').length);
 console.log('Diag: SPREADSHEET_ID present:', !!process.env.SPREADSHEET_ID);
 
-console.log(process.env.PRIVATE_KEY); // should show \n (literal)
-console.log(process.env.PRIVATE_KEY.replace(/\\n/g, '\n')); // should show real line breaks
+console.log(process.env.GOOGLE_PRIVATE_KEY); // should show \n (literal)
+console.log(process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')); // should show real line breaks
 
 // Handles both formats: real newlines or \n-escaped single line
 const PRIVATE_KEY = cfg.GOOGLE_PRIVATE_KEY.includes('\\n')
