@@ -17,7 +17,6 @@ const {
 } = require("discord.js");
 const noblox = require("noblox.js");
 const fetch = require("node-fetch");
-const { GoogleSpreadsheet } = require("google-spreadsheet");
 
 // Handles both formats: real newlines or \n-escaped single line
 const PRIVATE_KEY = cfg.GOOGLE_PRIVATE_KEY.includes('\\n')
