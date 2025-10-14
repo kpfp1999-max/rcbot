@@ -624,24 +624,24 @@ client.on("interactionCreate", async (interaction) => {
 
 // --- Google Sheets init (single, authoritative) ---
 
+const { GoogleAuth } = require('google-auth-library');
+
 async function initSheets() {
-  if (!process.env.GOOGLE_CLIENT_EMAIL) {
-    throw new Error('Missing GOOGLE_CLIENT_EMAIL');
-  }
-  if (!process.env.SPREADSHEET_ID) {
-    throw new Error('Missing SPREADSHEET_ID');
-  }
+  if (!process.env.GOOGLE_CLIENT_EMAIL) throw new Error('Missing GOOGLE_CLIENT_EMAIL');
+  if (!process.env.SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
 
   const privateKey = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
-  console.log('Diag: privateKey length:', privateKey.length);
 
   try {
-    const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
-
-    await doc.useServiceAccountAuth({
-      client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key: privateKey,
+    const auth = new GoogleAuth({
+      credentials: {
+        client_email: process.env.GOOGLE_CLIENT_EMAIL,
+        private_key: privateKey,
+      },
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
+
+    const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, auth);
 
     await doc.loadInfo();
     console.log('✅ Google Sheets connected:', doc.title);

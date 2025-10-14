@@ -8,8 +8,9 @@
   },
   "dependencies": {
     "discord.js": "^14.15.3",
-    "noblox.js": "^6.0.5",
+    "dotenv": "^17.2.3",
+    "google-auth-library": "^10.4.0",
     "google-spreadsheet": "^4.1.1",
-    "dotenv": "^17.2.3"
+    "noblox.js": "^6.0.5"
   }
 }
