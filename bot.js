@@ -615,7 +615,6 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // --- Google Sheets init (single, authoritative) ---
-const { GoogleSpreadsheet } = require('google-spreadsheet');
 
 function getPrivateKey() {
   const raw = (process.env.GOOGLE_PRIVATE_KEY || '').trim();
@@ -628,10 +627,6 @@ async function initSheets() {
   if (!process.env.SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
 
   const privateKey = getPrivateKey();
-
-  const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, {
-    auth: { client_email: process.env.GOOGLE_CLIENT_EMAIL, private_key: privateKey },
-  });
 
   await doc.loadInfo();
   console.log('✅ Google Sheets connected:', doc.title);
@@ -651,13 +646,6 @@ async function initSheets() {
     console.error('❌ Startup error:', err);
   }
 })();
-
-let GoogleSpreadsheet;
-try {
-  GoogleSpreadsheet = require('google-spreadsheet').GoogleSpreadsheet;
-} catch (err) {
-  GoogleSpreadsheet = null;
-}
 
 // Optional: basic error handlers to avoid crashing on unhandled rejections
 client.on("error", (err) => console.error("Discord client error:", err));
