@@ -24,6 +24,10 @@ console.log("Env present:", {
   SPREADSHEET_ID: !!process.env.SPREADSHEET_ID,
 });
 
+console.log('Diag: GOOGLE_CLIENT_EMAIL present:', !!process.env.GOOGLE_CLIENT_EMAIL);
+console.log('Diag: GOOGLE_PRIVATE_KEY length:', (process.env.GOOGLE_PRIVATE_KEY||'').length);
+console.log('Diag: SPREADSHEET_ID present:', !!process.env.SPREADSHEET_ID);
+
 
 // Handles both formats: real newlines or \n-escaped single line
 const PRIVATE_KEY = cfg.GOOGLE_PRIVATE_KEY.includes('\\n')
@@ -616,23 +620,27 @@ client.on("interactionCreate", async (interaction) => {
 
 // --- Google Sheets init (single, authoritative) ---
 
-function getPrivateKey() {
-  const raw = (process.env.GOOGLE_PRIVATE_KEY || '').trim();
-  if (!raw) throw new Error('GOOGLE_PRIVATE_KEY is empty');
-  return raw.includes('\\n') ? raw.replace(/\\n/g, '\n') : raw;
-}
-
 async function initSheets() {
   if (!process.env.GOOGLE_CLIENT_EMAIL) throw new Error('Missing GOOGLE_CLIENT_EMAIL');
   if (!process.env.SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
 
   const privateKey = getPrivateKey();
+  console.log('Diag: privateKey length:', privateKey.length); // non-secret check
 
-  await doc.loadInfo();
-  console.log('✅ Google Sheets connected:', doc.title);
-  return doc;
+  try {
+    doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
+    await doc.useServiceAccountAuth({
+      client_email: process.env.GOOGLE_CLIENT_EMAIL,
+      private_key: privateKey,
+    });
+    await doc.loadInfo();
+    console.log('✅ Google Sheets connected:', doc.title);
+    return doc;
+  } catch (err) {
+    console.error('❌ initSheets error:', err);
+    throw err;
+  }
 }
-
 
 
 // --- Startup sequence ---
