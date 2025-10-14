@@ -623,7 +623,6 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // --- Google Sheets init (single, authoritative) ---
-const { GoogleSpreadsheet } = require('google-spreadsheet');
 
 async function initSheets() {
   if (!process.env.GOOGLE_CLIENT_EMAIL) {
