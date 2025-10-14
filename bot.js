@@ -1,6 +1,7 @@
 // bot.txt
 
-require("dotenv").config();
+const cfg = require('./config');
+const { GoogleSpreadsheet } = require('google-spreadsheet');
 const {
   Client,
   GatewayIntentBits,
@@ -18,7 +19,11 @@ const noblox = require("noblox.js");
 const fetch = require("node-fetch");
 const { GoogleSpreadsheet } = require("google-spreadsheet");
 
-private_key: process.env.GOOGLE_PRIVATE_KEY
+// Handles both formats: real newlines or \n-escaped single line
+const PRIVATE_KEY = cfg.GOOGLE_PRIVATE_KEY.includes('\\n')
+  ? cfg.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
+  : cfg.GOOGLE_PRIVATE_KEY;
+
 
 // Discord client
 const client = new Client({
@@ -605,29 +610,32 @@ client.on("interactionCreate", async (interaction) => {
 
 // --- Google Sheets init (single, authoritative) ---
 async function initSheets() {
-  doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, {
+  doc = new GoogleSpreadsheet(cfg.SPREADSHEET_ID, {
     auth: {
-      client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      client_email: cfg.GOOGLE_CLIENT_EMAIL,
+      private_key: PRIVATE_KEY,
     },
   });
 
   await doc.loadInfo();
-  console.log("✅ Google Sheets connected:", doc.title);
-  console.log("Available sheets:", Object.keys(doc.sheetsByTitle));
+  console.log('✅ Google Sheets connected:', doc.title);
+  console.log('Available sheets:', Object.keys(doc.sheetsByTitle));
 }
+
 
 
 // --- Startup sequence ---
 (async () => {
   try {
     await initSheets();
-    await client.login(process.env.DISCORD_TOKEN);
-    console.log("✅ Bot logged in");
+    // ... your other startup (e.g., register commands)
+    // Then login
+    await client.login(cfg.DISCORD_TOKEN);
   } catch (err) {
-    console.error("❌ Startup error:", err);
+    console.error('❌ Startup error:', err);
   }
 })();
+
 
 // Optional: basic error handlers to avoid crashing on unhandled rejections
 client.on("error", (err) => console.error("Discord client error:", err));
