@@ -18,6 +18,13 @@ const {
 const noblox = require("noblox.js");
 const fetch = require("node-fetch");
 
+console.log("Env present:", {
+  GOOGLE_CLIENT_EMAIL: !!process.env.GOOGLE_CLIENT_EMAIL,
+  GOOGLE_PRIVATE_KEY: !!process.env.GOOGLE_PRIVATE_KEY,
+  SPREADSHEET_ID: !!process.env.SPREADSHEET_ID,
+});
+
+
 // Handles both formats: real newlines or \n-escaped single line
 const PRIVATE_KEY = cfg.GOOGLE_PRIVATE_KEY.includes('\\n')
   ? cfg.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
