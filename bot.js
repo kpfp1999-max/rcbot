@@ -603,12 +603,18 @@ client.on("interactionCreate", async (interaction) => {
 
 // --- Google Sheets init (single, authoritative) ---
 async function initSheets() {
-  doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
-  await doc.useServiceAccountAuth(creds);
+  doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, {
+    auth: {
+      client_email: process.env.GOOGLE_CLIENT_EMAIL,
+      private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    },
+  });
+
   await doc.loadInfo();
-  console.log("✅ Google Sheets connected");
+  console.log("✅ Google Sheets connected:", doc.title);
   console.log("Available sheets:", Object.keys(doc.sheetsByTitle));
 }
+
 
 // --- Startup sequence ---
 (async () => {
