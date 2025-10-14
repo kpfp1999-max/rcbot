@@ -624,7 +624,7 @@ async function initSheets() {
   if (!process.env.GOOGLE_CLIENT_EMAIL) throw new Error('Missing GOOGLE_CLIENT_EMAIL');
   if (!process.env.SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
 
-  const privateKey = getPrivateKey();
+  const privateKey = PRIVATE_KEY;
   console.log('Diag: privateKey length:', privateKey.length); // non-secret check
 
   try {
