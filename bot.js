@@ -31,6 +31,8 @@ console.log('Diag: SPREADSHEET_ID present:', !!process.env.SPREADSHEET_ID);
 console.log(process.env.GOOGLE_PRIVATE_KEY); // should show \n (literal)
 console.log(process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')); // should show real line breaks
 
+console.log('RAW KEY VALUE:', JSON.stringify(process.env.GOOGLE_PRIVATE_KEY).slice(0,200));
+
 // Handles both formats: real newlines or \n-escaped single line
 const GOOGLE_PRIVATE_KEY = cfg.GOOGLE_PRIVATE_KEY.includes('\\n')
   ? cfg.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
