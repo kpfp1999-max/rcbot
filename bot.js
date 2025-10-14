@@ -17,6 +17,7 @@ const {
 } = require("discord.js");
 const noblox = require("noblox.js");
 const fetch = require("node-fetch");
+const express = require('express');
 
 console.log("Env present:", {
   GOOGLE_CLIENT_EMAIL: !!process.env.GOOGLE_CLIENT_EMAIL,
@@ -64,6 +65,26 @@ try {
 } catch (e) {
   console.log("Health server not started:", e?.message || e);
 }
+
+// --- Health check server for Render / UptimeRobot ---
+const app = express();
+
+// Root route
+app.get('/', (req, res) => {
+  res.status(200).send('OK');
+});
+
+// Optional: dedicated /health route
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'up' });
+});
+
+// Render provides PORT automatically
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`Health server listening on :${PORT}`);
+});
+
 
 // Safe cell access helper (bounds guard)
 async function safeGetCell(sheet, row, col) {
