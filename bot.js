@@ -98,14 +98,14 @@ async function safeGetCell(sheet, row, col) {
 }
 
 // Sheet lookup helper (existence guard)
-function getSheetOrReply(doc, name, interaction) {
+function getSheetOrReply(interaction, title) {
   if (!sheetDoc) {
-    if (interaction) interaction.editReply?.("❌ Google Sheets not initialized yet.");
+    interaction.reply('❌ Google Sheets not initialized yet');
     return null;
   }
-  const sheet = doc.sheetsByTitle[name];
+  const sheet = sheetDoc.sheetsByTitle[title];
   if (!sheet) {
-    if (interaction) interaction.editReply?.(`❌ Sheet "${name}" not found.`);
+    interaction.reply(`❌ Sheet "${title}" not found`);
     return null;
   }
   return sheet;
@@ -425,8 +425,8 @@ if (action === "remove_user") {
   ];
 
   for (const sheetInfo of sheets) {
-    const sheet = getSheetOrReply(doc, sheetInfo.name, interaction);
-    if (!sheet) return;
+    const sheet = getSheetOrReply(interaction, 'MySheet');
+    if (!sheet) return; // bail if not ready
 
     await sheet.loadCells("A1:Z50");
 
@@ -675,10 +675,10 @@ async function initSheets() {
 // --- Startup sequence ---
 (async () => {
   try {
-    await initSheets();
-    await client.login(cfg.DISCORD_TOKEN);
+    await initSheets();          // sets sheetDoc
+    await client.login(TOKEN);   // only then log in
   } catch (err) {
-    console.error('❌ Startup error:', err);
+    console.error('Startup error:', err);
   }
 })();
 
