@@ -19,6 +19,8 @@ const noblox = require("noblox.js");
 const fetch = require("node-fetch");
 const express = require('express');
 
+let sheetDoc; // will hold the GoogleSpreadsheet instance
+
 console.log("Env present:", {
   GOOGLE_CLIENT_EMAIL: !!process.env.GOOGLE_CLIENT_EMAIL,
   GOOGLE_PRIVATE_KEY: !!process.env.GOOGLE_PRIVATE_KEY,
@@ -97,7 +99,7 @@ async function safeGetCell(sheet, row, col) {
 
 // Sheet lookup helper (existence guard)
 function getSheetOrReply(doc, name, interaction) {
-  if (!doc) {
+  if (!sheetDoc) {
     if (interaction) interaction.editReply?.("❌ Google Sheets not initialized yet.");
     return null;
   }
@@ -648,41 +650,38 @@ client.on("interactionCreate", async (interaction) => {
 const { GoogleAuth } = require('google-auth-library');
 
 async function initSheets() {
-  if (!process.env.GOOGLE_CLIENT_EMAIL) throw new Error('Missing GOOGLE_CLIENT_EMAIL');
-  if (!process.env.SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
+  const { GoogleSpreadsheet } = require('google-spreadsheet');
+  const { GoogleAuth } = require('google-auth-library');
 
   const privateKey = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
 
-  try {
-    const auth = new GoogleAuth({
-      credentials: {
-        client_email: process.env.GOOGLE_CLIENT_EMAIL,
-        private_key: privateKey,
-      },
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
+  const auth = new GoogleAuth({
+    credentials: {
+      client_email: process.env.GOOGLE_CLIENT_EMAIL,
+      private_key: privateKey,
+    },
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
 
-    const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, auth);
+  const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, auth);
+  await doc.loadInfo();
+  console.log('✅ Google Sheets connected:', doc.title);
 
-    await doc.loadInfo();
-    console.log('✅ Google Sheets connected:', doc.title);
-    return doc;
-  } catch (err) {
-    console.error('❌ initSheets error:', err);
-    throw err;
-  }
+  sheetDoc = doc; // save globally
+  return doc;
 }
+
 
 // --- Startup sequence ---
 (async () => {
   try {
     await initSheets();
-    // ... your other startup (e.g., register commands)
     await client.login(cfg.DISCORD_TOKEN);
   } catch (err) {
     console.error('❌ Startup error:', err);
   }
 })();
+
 
 // Optional: basic error handlers to avoid crashing on unhandled rejections
 client.on('error', (err) => console.error('Discord client error:', err));
