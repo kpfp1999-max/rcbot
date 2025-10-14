@@ -632,16 +632,26 @@ async function initSheets() {
   console.log('Diag: privateKey length:', privateKey.length);
 
   try {
-    doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, {
-      auth: {
-        client_email: process.env.GOOGLE_CLIENT_EMAIL,
-        private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      },
-    });
+const { GoogleSpreadsheet } = require('google-spreadsheet');
 
-    await doc.loadInfo();
-    console.log('✅ Google Sheets connected:', doc.title);
-    return doc;
+async function initSheets() {
+  if (!process.env.GOOGLE_CLIENT_EMAIL) throw new Error('Missing GOOGLE_CLIENT_EMAIL');
+  if (!process.env.SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
+
+  const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
+
+  await doc.useServiceAccountAuth({
+    client_email: process.env.GOOGLE_CLIENT_EMAIL,
+    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  });
+
+  await doc.loadInfo();
+  console.log('✅ Google Sheets connected:', doc.title);
+  return doc;
+  
+}
+
+   
   } catch (err) {
     console.error('❌ initSheets error:', err);
     throw err;
