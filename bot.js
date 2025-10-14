@@ -331,25 +331,53 @@ await interaction.editReply({ embeds: [embed], components: [badgeRow] });
 
 // Handle /trackermanager dropdown actions
 client.on("interactionCreate", async (interaction) => {
-  console.error('Uncaught Exception:', err); // <-- 'err' is undefined here
+  try {
+    // Only handle select menus
+    if (!interaction.isStringSelectMenu()) return;
+    if (!interaction.customId.startsWith("tracker_action_")) return;
+
+    // Ensure only the original user can use this menu
+    const actionUserId = interaction.customId.split("_").at(-1);
+    if (actionUserId !== interaction.user.id) {
+      return interaction.reply({
+        content: "❌ Only the original user can use this menu.",
+        ephemeral: true
+      });
+    }
+
+    // Get the action from the dropdown
+    const action = interaction.values[0];
+
+    // Ask the user for a username
+    await interaction.update({
+      content: `Enter the username for **${action.replace("_", " ")}**:`,
+      components: []
+    });
+
+    // Collect the next message from the same user
+    const filter = (m) => m.author.id === interaction.user.id;
+    const collected = await interaction.channel.awaitMessages({
+      filter,
+      max: 1,
+      time: 30000
+    });
+
+    if (!collected.size) {
+      return interaction.editReply({ content: "⏳ Timed out." });
+    }
+
+    const username = collected.first().content.trim();
+    // 👉 now you can pass `username` into your remove/add logic
+    console.log("Got username:", username);
+
+  } catch (err) {
+    console.error("Error handling tracker manager dropdown:", err);
+    if (interaction.isRepliable() && !interaction.replied) {
+      await interaction.reply({ content: "❌ Something went wrong.", ephemeral: true });
+    }
+  }
 });
 
-  if (!interaction.isStringSelectMenu()) return;
-  if (!interaction.customId.startsWith("tracker_action_")) return;
-
-  const actionUserId = interaction.customId.split("_").at(-1);
-  if (actionUserId !== interaction.user.id) {
-    return interaction.reply({ content: "❌ Only the original user can use this menu.", ephemeral: true });
-  }
-
-  const action = interaction.values[0];
-  await interaction.update({ content: `Enter the username for **${action.replace("_", " ")}**:`, components: [] });
-
-  const filter = (m) => m.author.id === interaction.user.id;
-  const collected = await interaction.channel.awaitMessages({ filter, max: 1, time: 30000 });
-  if (!collected.size) return interaction.editReply({ content: "⏳ Timed out." });
-
-  const username = collected.first().content.trim();
 
   // ---------------- ADD PLACEMENT ----------------
   if (action === "add_placement") {
