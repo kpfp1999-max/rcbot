@@ -675,10 +675,10 @@ async function initSheets() {
 // --- Startup sequence ---
 (async () => {
   try {
-    await initSheets();          // sets sheetDoc
-    await client.login(TOKEN);   // only then log in
+    await initSheets();                  // sets sheetDoc
+    await client.login(process.env.DISCORD_TOKEN);
   } catch (err) {
-    console.error('Startup error:', err);
+    console.error('❌ Startup error:', err);
   }
 })();
 
