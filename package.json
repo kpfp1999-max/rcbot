@@ -1,0 +1,15 @@
+{
+  "name": "rc-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "noblox.js": "^6.0.5",
+    "google-spreadsheet": "^4.1.1",
+    "dotenv": "^17.2.3"
+  }
+}
