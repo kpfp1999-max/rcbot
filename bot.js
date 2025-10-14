@@ -105,7 +105,7 @@ function getSheetOrReply(interaction, title) {
     }
     return interaction.followUp('❌ Google Sheets not initialized yet');
   }
-  const sheet = sheetDoc.sheetsByTitle[title];
+  const sheet = sheetDoc.sheetsByTitle[sheetInfo.name];
   if (!sheet) {
     if (!interaction.deferred && !interaction.replied) {
       return interaction.reply(`❌ Sheet "${title}" not found`);
@@ -331,6 +331,9 @@ await interaction.editReply({ embeds: [embed], components: [badgeRow] });
 
 // Handle /trackermanager dropdown actions
 client.on("interactionCreate", async (interaction) => {
+  console.error('Uncaught Exception:', err); // <-- 'err' is undefined here
+});
+
   if (!interaction.isStringSelectMenu()) return;
   if (!interaction.customId.startsWith("tracker_action_")) return;
 
@@ -417,21 +420,17 @@ client.on("interactionCreate", async (interaction) => {
 // ---------------- REMOVE USER ----------------
 if (action === "remove_user") {
   const sheets = [
-    { name: "RECRUITS", rows: [11, 31], clear: (sheet, row) => {
-      sheet.getCell(row, 4).value = "";
-      sheet.getCell(row, 12).value = "";
-      sheet.getCell(row, 13).value = "";
-    }},
-    { name: "COMMANDOS", rows: [8, 13], altRows: [15, 27] },
-    { name: "YAYAX", rows: [10, 13], altRows: [15, 24] },
-    { name: "OMEGA", rows: [10, 13], altRows: [15, 24] },
-    { name: "DELTA", rows: [10, 13], altRows: [15, 18] },
-    { name: "CLONE FORCE 99", rows: [10, 10], altRows: [12, 15] }
+    { name: "RECRUITS", rows: [11, 31] },
+    { name: "COMMANDOS", rows: [9, 14], altRows: [16, 28] },
+    { name: "YAYAX", rows: [11, 14], altRows: [16, 25] },
+    { name: "OMEGA", rows: [11, 14], altRows: [16, 25] },
+    { name: "DELTA", rows: [11, 14], altRows: [16, 19] },
+    { name: "CLONE FORCE 99", rows: [11, 11], altRows: [13, 16] }
   ];
 
   for (const sheetInfo of sheets) {
-    const sheet = getSheetOrReply(interaction, 'MySheet');
-    if (!sheet) return; // bail if not ready
+    const sheet = sheetDoc.sheetsByTitle[sheetInfo.name];
+    if (!sheet) continue;
 
     await sheet.loadCells("A1:Z50");
 
@@ -447,48 +446,53 @@ if (action === "remove_user") {
       : [];
 
     for (const row of [...checkRows, ...altRows]) {
-  const cell = sheet.getCell(row, 4);
-  if (cell.value === username) {
-    cell.value = "";
-    sheet.getCell(row, 5).value = 0;
+      const cell = sheet.getCell(row, 4); // column D = username
+      if (cell.value === username) {
+        // Name column
+        if (checkRows.includes(row)) {
+          cell.value = "-";
+        } else {
+          cell.value = "";
+        }
 
-    // Only reset time (col G) if this row is in altRows AND sheet is not "CLONE FORCE 99"
-    if (altRows.includes(row) && sheetInfo.name !== "CLONE FORCE 99") {
-      const gCell = sheet.getCell(row, 6);
-      gCell.value = 0; // 0 = 12:00:00 AM
-    }
+        // F column
+        sheet.getCell(row, 5).value = 0;
 
-    const formulaCell = sheet.getCell(row, 7);
-    if (formulaCell.formula) {
-      formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
-    }
-    sheet.getCell(row, 8).value = "N/A";
-    sheet.getCell(row, 9).value = "N/A";
-    sheet.getCell(row, 10).value = "N/A";
-    sheet.getCell(row, 11).value = "";
-    sheet.getCell(row, 12).value = "E";
+        // G column (time) — only for altRows and not CF99
+        if (altRows.includes(row) && sheetInfo.name !== "CLONE FORCE 99") {
+          sheet.getCell(row, 6).value = "0:00";
+        }
 
-    // Extra cleanup if in RECRUITS
-    if (sheetInfo.name === "RECRUITS") {
-      for (let col = 5; col <= 8; col++) {
-        sheet.getCell(row, col).value = false;
+        // H column (formula)
+        const formulaCell = sheet.getCell(row, 7);
+        if (formulaCell.formula) {
+          formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
+        }
+
+        // I, J, K, L, M
+        sheet.getCell(row, 8).value = "N/A";
+        sheet.getCell(row, 9).value = "N/A";
+        sheet.getCell(row, 10).value = "N/A";
+        sheet.getCell(row, 11).value = "";
+        sheet.getCell(row, 12).value = "E";
+
+        // Extra cleanup if in RECRUITS
+        if (sheetInfo.name === "RECRUITS") {
+          sheet.getCell(row, 12).value = "";
+          sheet.getCell(row, 13).value = "";
+        }
+
+        await sheet.saveUpdatedCells();
+        return interaction.editReply({
+          content: `✅ Removed **${username}** from ${sheetInfo.name}.`
+        });
       }
-      sheet.getCell(row, 12).value = "";
-      sheet.getCell(row, 13).value = "";
     }
+  }
 
-    await sheet.saveUpdatedCells();
-    return interaction.editReply({
-      content: `✅ Removed **${username}** from ${sheetInfo.name}.`
-    });
-  }
-}
-  }
   return interaction.editReply({ content: "❌ User not found in any sheet." });
 }
 
-
-});
 
 // Handle /robloxmanager dropdown actions
 client.on("interactionCreate", async (interaction) => {
@@ -689,10 +693,14 @@ async function initSheets() {
 
 
 // Optional: basic error handlers to avoid crashing on unhandled rejections
-client.on('error', (err) => console.error('Discord client error:', err));
-process.on('unhandledRejection', (reason) =>
-  console.error('Unhandled Rejection:', reason)
-);
-process.on('uncaughtException', (err) =>
-  console.error('Uncaught Exception:', err)
-);
+client.on('error', (err) => {
+  console.error('Discord client error:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
