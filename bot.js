@@ -18,6 +18,8 @@ const noblox = require("noblox.js");
 const fetch = require("node-fetch");
 const { GoogleSpreadsheet } = require("google-spreadsheet");
 
+private_key: process.env.GOOGLE_PRIVATE_KEY
+
 // Discord client
 const client = new Client({
   intents: [
