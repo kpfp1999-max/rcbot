@@ -330,6 +330,7 @@ await interaction.editReply({ embeds: [embed], components: [badgeRow] });
 });
 
 // Handle /trackermanager dropdown actions
+// Handle /trackermanager dropdown actions
 client.on("interactionCreate", async (interaction) => {
   try {
     // Only handle select menus
@@ -367,43 +368,141 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const username = collected.first().content.trim();
-    // 👉 now you can pass `username` into your remove/add logic
     console.log("Got username:", username);
+
+    // ---------------- ADD PLACEMENT ----------------
+    if (action === "add_placement") {
+      await interaction.editReply({
+        content: `Enter two dates for **${username}** in format: XX/XX/XX XX/XX/XX`
+      });
+
+      const dateMsg = await interaction.channel.awaitMessages({
+        filter,
+        max: 1,
+        time: 30000
+      });
+      if (!dateMsg.size) {
+        return interaction.editReply({ content: "⏳ Timed out." });
+      }
+
+      const [startDate, endDate] = dateMsg.first().content.trim().split(" ");
+      const recruits = getSheetOrReply(doc, "RECRUITS", interaction);
+      if (!recruits) return;
+
+      await recruits.loadCells("E12:N32");
+
+      for (let row = 11; row <= 31; row++) {
+        const cell = recruits.getCell(row, 4); // Column E
+        if (!cell.value) {
+          cell.value = username;
+          recruits.getCell(row, 12).value = startDate; // Column M
+          recruits.getCell(row, 13).value = endDate;   // Column N
+          await recruits.saveUpdatedCells();
+          return interaction.editReply({
+            content: `✅ Added **${username}** to RECRUITS with dates.`
+          });
+        }
+      }
+      return interaction.editReply({
+        content: "❌ No empty slot found in RECRUITS."
+      });
+    }
+
+    // ---------------- REMOVE USER ----------------
+    else if (action === "remove_user") {
+      // Call your remove_user logic here
+      await removeUserFromSheets(interaction, username);
+      return; // removeUserFromSheets should handle replies
+    }
+
+    // ---------------- ADD USER ----------------
+    else if (action === "add_user") {
+      await interaction.editReply({
+        content: `Which sheet should **${username}** be added to? (e.g. RECRUITS, COMMANDOS)`
+      });
+
+      const sheetMsg = await interaction.channel.awaitMessages({
+        filter,
+        max: 1,
+        time: 30000
+      });
+      if (!sheetMsg.size) {
+        return interaction.editReply({ content: "⏳ Timed out." });
+      }
+
+      const sheetName = sheetMsg.first().content.trim().toUpperCase();
+      const sheet = getSheetOrReply(doc, sheetName, interaction);
+      if (!sheet) return;
+
+      await sheet.loadCells("A1:Z50");
+      for (let row = 11; row <= 31; row++) {
+        const cell = sheet.getCell(row, 4);
+        if (!cell.value) {
+          cell.value = username;
+          await sheet.saveUpdatedCells();
+          return interaction.editReply({
+            content: `✅ Added **${username}** to ${sheetName}.`
+          });
+        }
+      }
+      return interaction.editReply({
+        content: `❌ No empty slot found in ${sheetName}.`
+      });
+    }
+
+    // ---------------- UPDATE BADGES ----------------
+    else if (action === "update_badges") {
+      await interaction.editReply({
+        content: `Enter the new badge(s) for **${username}** (comma separated):`
+      });
+
+      const badgeMsg = await interaction.channel.awaitMessages({
+        filter,
+        max: 1,
+        time: 30000
+      });
+      if (!badgeMsg.size) {
+        return interaction.editReply({ content: "⏳ Timed out." });
+      }
+
+      const badges = badgeMsg.first().content.trim();
+      const sheet = getSheetOrReply(doc, "BADGES", interaction);
+      if (!sheet) return;
+
+      await sheet.loadCells("A1:Z100");
+      for (let row = 1; row < 100; row++) {
+        const cell = sheet.getCell(row, 0);
+        if (cell.value === username) {
+          sheet.getCell(row, 1).value = badges;
+          await sheet.saveUpdatedCells();
+          return interaction.editReply({
+            content: `✅ Updated badges for **${username}**: ${badges}`
+          });
+        }
+      }
+      return interaction.editReply({
+        content: `❌ Could not find ${username} in BADGES sheet.`
+      });
+    }
+
+    // ---------------- DEFAULT ----------------
+    else {
+      await interaction.editReply({
+        content: `⚠️ Action **${action}** not yet implemented.`
+      });
+    }
 
   } catch (err) {
     console.error("Error handling tracker manager dropdown:", err);
     if (interaction.isRepliable() && !interaction.replied) {
-      await interaction.reply({ content: "❌ Something went wrong.", ephemeral: true });
+      await interaction.reply({
+        content: "❌ Something went wrong.",
+        ephemeral: true
+      });
     }
   }
 });
 
-
-  // ---------------- ADD PLACEMENT ----------------
-  if (action === "add_placement") {
-    await interaction.editReply({ content: `Enter two dates for **${username}** in format: XX/XX/XX XX/XX/XX` });
-    const dateMsg = await interaction.channel.awaitMessages({ filter, max: 1, time: 30000 });
-    if (!dateMsg.size) return interaction.editReply({ content: "⏳ Timed out." });
-
-    const [startDate, endDate] = dateMsg.first().content.trim().split(" ");
-    const recruits = getSheetOrReply(doc, "RECRUITS", interaction);
-    if (!recruits) return;
-
-    await recruits.loadCells("E12:N32");
-
-    // rows 11..31 (0-based indexing for getCell)
-    for (let row = 11; row <= 31; row++) {
-      const cell = recruits.getCell(row, 4); // Column E
-      if (!cell.value) {
-        cell.value = username;
-        recruits.getCell(row, 12).value = startDate; // Column M
-        recruits.getCell(row, 13).value = endDate;   // Column N
-        await recruits.saveUpdatedCells();
-        return interaction.editReply({ content: `✅ Added **${username}** to RECRUITS with dates.` });
-      }
-    }
-    return interaction.editReply({ content: "❌ No empty slot found in RECRUITS." });
-  }
 
   // ---------------- PROMOTE PLACEMENT ----------------
   if (action === "promote_placement") {
