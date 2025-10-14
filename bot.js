@@ -623,49 +623,41 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // --- Google Sheets init (single, authoritative) ---
+const { GoogleSpreadsheet } = require('google-spreadsheet');
 
 async function initSheets() {
-  if (!process.env.GOOGLE_CLIENT_EMAIL) throw new Error('Missing GOOGLE_CLIENT_EMAIL');
-  if (!process.env.SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
+  if (!process.env.GOOGLE_CLIENT_EMAIL) {
+    throw new Error('Missing GOOGLE_CLIENT_EMAIL');
+  }
+  if (!process.env.SPREADSHEET_ID) {
+    throw new Error('Missing SPREADSHEET_ID');
+  }
 
   const privateKey = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
   console.log('Diag: privateKey length:', privateKey.length);
 
   try {
-const { GoogleSpreadsheet } = require('google-spreadsheet');
+    const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
 
-async function initSheets() {
-  if (!process.env.GOOGLE_CLIENT_EMAIL) throw new Error('Missing GOOGLE_CLIENT_EMAIL');
-  if (!process.env.SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
+    await doc.useServiceAccountAuth({
+      client_email: process.env.GOOGLE_CLIENT_EMAIL,
+      private_key: privateKey,
+    });
 
-  const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
-
-  await doc.useServiceAccountAuth({
-    client_email: process.env.GOOGLE_CLIENT_EMAIL,
-    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-  });
-
-  await doc.loadInfo();
-  console.log('✅ Google Sheets connected:', doc.title);
-  return doc;
-  
-}
-
-   
+    await doc.loadInfo();
+    console.log('✅ Google Sheets connected:', doc.title);
+    return doc;
   } catch (err) {
     console.error('❌ initSheets error:', err);
     throw err;
   }
 }
 
-
-
 // --- Startup sequence ---
 (async () => {
   try {
     await initSheets();
     // ... your other startup (e.g., register commands)
-    // Then login
     await client.login(cfg.DISCORD_TOKEN);
   } catch (err) {
     console.error('❌ Startup error:', err);
@@ -673,6 +665,10 @@ async function initSheets() {
 })();
 
 // Optional: basic error handlers to avoid crashing on unhandled rejections
-client.on("error", (err) => console.error("Discord client error:", err));
-process.on("unhandledRejection", (reason) => console.error("Unhandled Rejection:", reason));
-process.on("uncaughtException", (err) => console.error("Uncaught Exception:", err));
+client.on('error', (err) => console.error('Discord client error:', err));
+process.on('unhandledRejection', (reason) =>
+  console.error('Unhandled Rejection:', reason)
+);
+process.on('uncaughtException', (err) =>
+  console.error('Uncaught Exception:', err)
+);
