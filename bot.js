@@ -100,16 +100,21 @@ async function safeGetCell(sheet, row, col) {
 // Sheet lookup helper (existence guard)
 function getSheetOrReply(interaction, title) {
   if (!sheetDoc) {
-    interaction.reply('❌ Google Sheets not initialized yet');
-    return null;
+    if (!interaction.deferred && !interaction.replied) {
+      return interaction.reply('❌ Google Sheets not initialized yet');
+    }
+    return interaction.followUp('❌ Google Sheets not initialized yet');
   }
   const sheet = sheetDoc.sheetsByTitle[title];
   if (!sheet) {
-    interaction.reply(`❌ Sheet "${title}" not found`);
-    return null;
+    if (!interaction.deferred && !interaction.replied) {
+      return interaction.reply(`❌ Sheet "${title}" not found`);
+    }
+    return interaction.followUp(`❌ Sheet "${title}" not found`);
   }
   return sheet;
 }
+
 
 // Roblox cookie init
 (async () => {
