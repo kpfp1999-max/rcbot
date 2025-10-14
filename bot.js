@@ -615,17 +615,27 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // --- Google Sheets init (single, authoritative) ---
+const { GoogleSpreadsheet } = require('google-spreadsheet');
+
+function getPrivateKey() {
+  const raw = (process.env.GOOGLE_PRIVATE_KEY || '').trim();
+  if (!raw) throw new Error('GOOGLE_PRIVATE_KEY is empty');
+  return raw.includes('\\n') ? raw.replace(/\\n/g, '\n') : raw;
+}
+
 async function initSheets() {
-  doc = new GoogleSpreadsheet(cfg.SPREADSHEET_ID, {
-    auth: {
-      client_email: cfg.GOOGLE_CLIENT_EMAIL,
-      private_key: PRIVATE_KEY,
-    },
+  if (!process.env.GOOGLE_CLIENT_EMAIL) throw new Error('Missing GOOGLE_CLIENT_EMAIL');
+  if (!process.env.SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
+
+  const privateKey = getPrivateKey();
+
+  const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, {
+    auth: { client_email: process.env.GOOGLE_CLIENT_EMAIL, private_key: privateKey },
   });
 
   await doc.loadInfo();
   console.log('✅ Google Sheets connected:', doc.title);
-  console.log('Available sheets:', Object.keys(doc.sheetsByTitle));
+  return doc;
 }
 
 
