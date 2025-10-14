@@ -32,7 +32,7 @@ console.log(process.env.GOOGLE_PRIVATE_KEY); // should show \n (literal)
 console.log(process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')); // should show real line breaks
 
 // Handles both formats: real newlines or \n-escaped single line
-const PRIVATE_KEY = cfg.GOOGLE_PRIVATE_KEY.includes('\\n')
+const GOOGLE_PRIVATE_KEY = cfg.GOOGLE_PRIVATE_KEY.includes('\\n')
   ? cfg.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
   : cfg.GOOGLE_PRIVATE_KEY;
 
