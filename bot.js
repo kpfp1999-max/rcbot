@@ -652,6 +652,12 @@ async function initSheets() {
   }
 })();
 
+let GoogleSpreadsheet;
+try {
+  GoogleSpreadsheet = require('google-spreadsheet').GoogleSpreadsheet;
+} catch (err) {
+  GoogleSpreadsheet = null;
+}
 
 // Optional: basic error handlers to avoid crashing on unhandled rejections
 client.on("error", (err) => console.error("Discord client error:", err));
