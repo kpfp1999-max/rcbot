@@ -633,7 +633,7 @@ async function initSheets() {
     doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, {
       auth: {
         client_email: process.env.GOOGLE_CLIENT_EMAIL,
-        private_key: privateKey,
+        private_key: process.env.GOOGLE_PRIVATE_KEY,
       },
     });
 
