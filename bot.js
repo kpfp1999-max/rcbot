@@ -414,7 +414,7 @@ client.on("interactionCreate", async (interaction) => {
               // --- Always set column G to 12:00:00 AM as a time value ---
               const gCell = sheet.getCell(row, 6);
               gCell.value = 0; // 0 means midnight in Google Sheets
-              gCell.numberFormat = { type: 'TIME', pattern: 'h:mm:ss AM/PM' };
+              gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
 
               const formulaCell = sheet.getCell(row, 7);
               if (formulaCell.formula) {
