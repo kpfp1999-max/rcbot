@@ -240,7 +240,7 @@ if (interaction.commandName === "bgc") {
 
     const groups = Array.isArray(groupsJson.data) ? groupsJson.data : [];
     const totalGroups = groups.length;
-    const importantGroupIds = [34808935, 34794384, 35250103, 35335293, 5232591];
+    const importantGroupIds = [34808935, 34794384, 35250103, 35335293, 5232591, 34755744];
     const matchedKeyGroups = groups
       .filter((g) => importantGroupIds.includes(Number(g.group.id)))
       .map((g) => `${g.group.name} — ${g.role?.name ?? "Member"}`);
@@ -330,14 +330,11 @@ await interaction.editReply({ embeds: [embed], components: [badgeRow] });
 });
 
 // Handle /trackermanager dropdown actions
-// Handle /trackermanager dropdown actions
 client.on("interactionCreate", async (interaction) => {
   try {
-    // Only handle select menus
     if (!interaction.isStringSelectMenu()) return;
     if (!interaction.customId.startsWith("tracker_action_")) return;
 
-    // Ensure only the original user can use this menu
     const actionUserId = interaction.customId.split("_").at(-1);
     if (actionUserId !== interaction.user.id) {
       return interaction.reply({
@@ -346,7 +343,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // Get the action from the dropdown
     const action = interaction.values[0];
 
     // Ask the user for a username
@@ -355,20 +351,17 @@ client.on("interactionCreate", async (interaction) => {
       components: []
     });
 
-    // Collect the next message from the same user
     const filter = (m) => m.author.id === interaction.user.id;
     const collected = await interaction.channel.awaitMessages({
       filter,
       max: 1,
       time: 30000
     });
-
     if (!collected.size) {
       return interaction.editReply({ content: "⏳ Timed out." });
     }
 
     const username = collected.first().content.trim();
-    console.log("Got username:", username);
 
     // ---------------- ADD PLACEMENT ----------------
     if (action === "add_placement") {
@@ -410,13 +403,101 @@ client.on("interactionCreate", async (interaction) => {
 
     // ---------------- REMOVE USER ----------------
     else if (action === "remove_user") {
-      // Call your remove_user logic here
-      await removeUserFromSheets(interaction, username);
-      return; // removeUserFromSheets should handle replies
+      const sheets = [
+        { name: "RECRUITS", rows: [11, 31] },
+        { name: "COMMANDOS", rows: [8, 13], altRows: [15, 27] },
+        { name: "YAYAX", rows: [10, 13], altRows: [15, 24] },
+        { name: "OMEGA", rows: [10, 13], altRows: [15, 24] },
+        { name: "DELTA", rows: [10, 13], altRows: [15, 18] },
+        { name: "CLONE FORCE 99", rows: [10, 10], altRows: [12, 15] }
+      ];
+
+      for (const sheetInfo of sheets) {
+        const sheet = getSheetOrReply(doc, sheetInfo.name, interaction);
+        if (!sheet) return;
+
+        await sheet.loadCells("A1:Z50");
+
+        const checkRows = Array.from(
+          { length: sheetInfo.rows[1] - sheetInfo.rows[0] + 1 },
+          (_, i) => i + sheetInfo.rows[0]
+        );
+        const altRows = sheetInfo.altRows
+          ? Array.from(
+              { length: sheetInfo.altRows[1] - sheetInfo.altRows[0] + 1 },
+              (_, i) => i + sheetInfo.altRows[0]
+            )
+          : [];
+
+        for (const row of [...checkRows, ...altRows]) {
+          const cell = sheet.getCell(row, 4);
+          if (cell.value === username) {
+            cell.value = "";
+            sheet.getCell(row, 5).value = 0;
+
+            if (altRows.includes(row) && sheetInfo.name !== "CLONE FORCE 99") {
+              sheet.getCell(row, 6).value = 0;
+            }
+
+            const formulaCell = sheet.getCell(row, 7);
+            if (formulaCell.formula) {
+              formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
+            }
+
+            sheet.getCell(row, 8).value = "N/A";
+            sheet.getCell(row, 9).value = "N/A";
+            sheet.getCell(row, 10).value = "N/A";
+            sheet.getCell(row, 11).value = "";
+            sheet.getCell(row, 12).value = "E";
+
+            if (sheetInfo.name === "RECRUITS") {
+              for (let col = 5; col <= 8; col++) {
+                sheet.getCell(row, col).value = false;
+              }
+              sheet.getCell(row, 12).value = "";
+              sheet.getCell(row, 13).value = "";
+            }
+
+            await sheet.saveUpdatedCells();
+            return interaction.editReply({
+              content: `✅ Removed **${username}** from ${sheetInfo.name}.`
+            });
+          }
+        }
+      }
+      return interaction.editReply({ content: "❌ User not found in any sheet." });
     }
 
-    // ---------------- ADD USER ----------------
-    else if (action === "add_user") {
+  } catch (err) {
+    console.error("Error handling tracker manager dropdown:", err);
+    if (interaction.isRepliable() && !interaction.replied) {
+      await interaction.reply({ content: "❌ Something went wrong.", ephemeral: true });
+    }
+  }
+});
+
+// Handle /robloxmanager dropdown actions
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isStringSelectMenu()) return;
+  if (!interaction.customId.startsWith("rc_action_")) return;
+
+  const actionUserId = interaction.customId.split("_").at(-1);
+  if (actionUserId !== interaction.user.id) {
+    return interaction.reply({ content: "❌ Only the original user can use this menu.", ephemeral: true });
+  }
+
+  const isAdmin = interaction.member?.permissions?.has(PermissionsBitField.Flags.Administrator);
+  if (!isAdmin) {
+    return interaction.reply({ content: "❌ Administrator permission required.", ephemeral: true });
+  }
+
+  const action = interaction.values[0];
+  const groupId = 35335293;
+
+  await interaction.deferReply();
+
+  try {
+    if (action === "add_user") {
       await interaction.editReply({
         content: `Which sheet should **${username}** be added to? (e.g. RECRUITS, COMMANDOS)`
       });
@@ -449,40 +530,87 @@ client.on("interactionCreate", async (interaction) => {
         content: `❌ No empty slot found in ${sheetName}.`
       });
     }
+  } catch (err) {
+    console.error("Error handling roblox manager dropdown:", err);
+    if (interaction.isRepliable() && !interaction.replied) {
+      await interaction.reply({ content: "❌ Something went wrong.", ephemeral: true });
+    }
+  }
+});
+    // Handle /trackermanager dropdown actions
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.isStringSelectMenu()) return;
+    if (!interaction.customId.startsWith("tracker_action_")) return;
 
-    // ---------------- UPDATE BADGES ----------------
-    else if (action === "update_badges") {
-      await interaction.editReply({
-        content: `Enter the new badge(s) for **${username}** (comma separated):`
+    const actionUserId = interaction.customId.split("_").at(-1);
+    if (actionUserId !== interaction.user.id) {
+      return interaction.reply({
+        content: "❌ Only the original user can use this menu.",
+        ephemeral: true
       });
+    }
 
-      const badgeMsg = await interaction.channel.awaitMessages({
-        filter,
-        max: 1,
-        time: 30000
-      });
-      if (!badgeMsg.size) {
-        return interaction.editReply({ content: "⏳ Timed out." });
-      }
+    const action = interaction.values[0];
 
-      const badges = badgeMsg.first().content.trim();
-      const sheet = getSheetOrReply(doc, "BADGES", interaction);
-      if (!sheet) return;
+    // Ask the user for a username
+    await interaction.update({
+      content: `Enter the username for **${action.replace("_", " ")}**:`,
+      components: []
+    });
 
-      await sheet.loadCells("A1:Z100");
-      for (let row = 1; row < 100; row++) {
-        const cell = sheet.getCell(row, 0);
+    const filter = (m) => m.author.id === interaction.user.id;
+    const collected = await interaction.channel.awaitMessages({
+      filter,
+      max: 1,
+      time: 30000
+    });
+    if (!collected.size) {
+      return interaction.editReply({ content: "⏳ Timed out." });
+    }
+
+    const username = collected.first().content.trim();
+
+    // ---------------- PROMOTE PLACEMENT ----------------
+    if (action === "promote_placement") {
+      const recruits = getSheetOrReply(doc, "RECRUITS", interaction);
+      const commandos = getSheetOrReply(doc, "COMMANDOS", interaction);
+      if (!recruits || !commandos) return;
+
+      await recruits.loadCells("E12:N32");
+      await commandos.loadCells("E16:E28");
+
+      let foundRow = null;
+      for (let row = 11; row <= 31; row++) {
+        const cell = recruits.getCell(row, 4);
         if (cell.value === username) {
-          sheet.getCell(row, 1).value = badges;
-          await sheet.saveUpdatedCells();
-          return interaction.editReply({
-            content: `✅ Updated badges for **${username}**: ${badges}`
-          });
+          foundRow = row;
+          break;
         }
       }
-      return interaction.editReply({
-        content: `❌ Could not find ${username} in BADGES sheet.`
-      });
+      if (!foundRow) {
+        return interaction.editReply({ content: "❌ User not found in RECRUITS." });
+      }
+
+      for (let row = 15; row <= 27; row++) {
+        const cell = commandos.getCell(row, 4);
+        if (!cell.value || cell.value === "-") {
+          cell.value = username;
+          await commandos.saveUpdatedCells();
+
+          recruits.getCell(foundRow, 4).value = "";
+          for (let col = 5; col <= 8; col++) {
+            recruits.getCell(foundRow, col).value = false;
+          }
+          recruits.getCell(foundRow, 12).value = "";
+          recruits.getCell(foundRow, 13).value = "";
+
+          await recruits.saveUpdatedCells();
+
+          return interaction.editReply({ content: `✅ Promoted **${username}** to COMMANDOS.` });
+        }
+      }
+      return interaction.editReply({ content: "❌ No empty slot in COMMANDOS." });
     }
 
     // ---------------- DEFAULT ----------------
@@ -502,47 +630,6 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 });
-
-
-  // ---------------- PROMOTE PLACEMENT ----------------
-  if (action === "promote_placement") {
-    const recruits = getSheetOrReply(doc, "RECRUITS", interaction);
-    const commandos = getSheetOrReply(doc, "COMMANDOS", interaction);
-    if (!recruits || !commandos) return;
-
-    await recruits.loadCells("E12:N32");
-    await commandos.loadCells("E16:E28");
-
-    let foundRow = null;
-    for (let row = 11; row <= 31; row++) {
-      const cell = recruits.getCell(row, 4);
-      if (cell.value === username) {
-        foundRow = row;
-        break;
-      }
-    }
-    if (!foundRow) return interaction.editReply({ content: "❌ User not found in RECRUITS." });
-
-    for (let row = 15; row <= 27; row++) {
-      const cell = commandos.getCell(row, 4);
-      if (!cell.value || cell.value === "-") {
-        cell.value = username;
-        await commandos.saveUpdatedCells();
-
-        recruits.getCell(foundRow, 4).value = "";
-        for (let col = 5; col <= 8; col++) {
-         recruits.getCell(foundRow, col).value = false; // uncheck
-       }
-       recruits.getCell(foundRow, 12).value = "";
-       recruits.getCell(foundRow, 13).value = "";
-
-       await recruits.saveUpdatedCells();
-
-        return interaction.editReply({ content: `✅ Promoted **${username}** to COMMANDOS.` });
-      }
-    }
-    return interaction.editReply({ content: "❌ No empty slot in COMMANDOS." });
-  }
 
 // ---------------- REMOVE USER ----------------
 if (action === "remove_user") {
