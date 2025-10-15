@@ -613,6 +613,76 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ content: "❌ No empty slot in COMMANDOS." });
     }
 
+    // ---------------- REMOVE USER ----------------
+    else if (action === "remove_user") {
+      const sheets = [
+        { name: "RECRUITS", rows: [11, 31] },
+        { name: "COMMANDOS", rows: [9, 14], altRows: [16, 28] },
+        { name: "YAYAX", rows: [11, 14], altRows: [16, 25] },
+        { name: "OMEGA", rows: [11, 14], altRows: [16, 25] },
+        { name: "DELTA", rows: [11, 14], altRows: [16, 19] },
+        { name: "CLONE FORCE 99", rows: [11, 11], altRows: [13, 16] }
+      ];
+
+      for (const sheetInfo of sheets) {
+        const sheet = sheetDoc.sheetsByTitle[sheetInfo.name];
+        if (!sheet) continue;
+
+        await sheet.loadCells("A1:Z50");
+
+        const checkRows = Array.from(
+          { length: sheetInfo.rows[1] - sheetInfo.rows[0] + 1 },
+          (_, i) => i + sheetInfo.rows[0]
+        );
+        const altRows = sheetInfo.altRows
+          ? Array.from(
+              { length: sheetInfo.altRows[1] - sheetInfo.altRows[0] + 1 },
+              (_, i) => i + sheetInfo.altRows[0]
+            )
+          : [];
+
+        for (const row of [...checkRows, ...altRows]) {
+          const cell = sheet.getCell(row, 4); // column E
+          if (cell.value === username) {
+            if (checkRows.includes(row)) {
+              cell.value = "-";
+            } else {
+              cell.value = "";
+            }
+
+            sheet.getCell(row, 5).value = 0;
+
+            if (altRows.includes(row) && sheetInfo.name !== "CLONE FORCE 99") {
+              sheet.getCell(row, 6).value = "0:00";
+            }
+
+            const formulaCell = sheet.getCell(row, 7);
+            if (formulaCell.formula) {
+              formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
+            }
+
+            sheet.getCell(row, 8).value = "N/A";
+            sheet.getCell(row, 9).value = "N/A";
+            sheet.getCell(row, 10).value = "N/A";
+            sheet.getCell(row, 11).value = "";
+            sheet.getCell(row, 12).value = "E";
+
+            if (sheetInfo.name === "RECRUITS") {
+              sheet.getCell(row, 12).value = "";
+              sheet.getCell(row, 13).value = "";
+            }
+
+            await sheet.saveUpdatedCells();
+            return interaction.editReply({
+              content: `✅ Removed **${username}** from ${sheetInfo.name}.`
+            });
+          }
+        }
+      }
+
+      return interaction.editReply({ content: "❌ User not found in any sheet." });
+    }
+
     // ---------------- DEFAULT ----------------
     else {
       await interaction.editReply({
@@ -631,81 +701,6 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// ---------------- REMOVE USER ----------------
-if (action === "remove_user") {
-  const sheets = [
-    { name: "RECRUITS", rows: [11, 31] },
-    { name: "COMMANDOS", rows: [9, 14], altRows: [16, 28] },
-    { name: "YAYAX", rows: [11, 14], altRows: [16, 25] },
-    { name: "OMEGA", rows: [11, 14], altRows: [16, 25] },
-    { name: "DELTA", rows: [11, 14], altRows: [16, 19] },
-    { name: "CLONE FORCE 99", rows: [11, 11], altRows: [13, 16] }
-  ];
-
-  for (const sheetInfo of sheets) {
-    const sheet = sheetDoc.sheetsByTitle[sheetInfo.name];
-    if (!sheet) continue;
-
-    await sheet.loadCells("A1:Z50");
-
-    const checkRows = Array.from(
-      { length: sheetInfo.rows[1] - sheetInfo.rows[0] + 1 },
-      (_, i) => i + sheetInfo.rows[0]
-    );
-    const altRows = sheetInfo.altRows
-      ? Array.from(
-          { length: sheetInfo.altRows[1] - sheetInfo.altRows[0] + 1 },
-          (_, i) => i + sheetInfo.altRows[0]
-        )
-      : [];
-
-    for (const row of [...checkRows, ...altRows]) {
-      const cell = sheet.getCell(row, 4); // column E (0‑based index 4)
-      if (cell.value === username) {
-        // Name column
-        if (checkRows.includes(row)) {
-          cell.value = "-";
-        } else {
-          cell.value = "";
-        }
-
-        // F column
-        sheet.getCell(row, 5).value = 0;
-
-        // G column (time) — only for altRows and not CF99
-        if (altRows.includes(row) && sheetInfo.name !== "CLONE FORCE 99") {
-          sheet.getCell(row, 6).value = "0:00";
-        }
-
-        // H column (formula)
-        const formulaCell = sheet.getCell(row, 7);
-        if (formulaCell.formula) {
-          formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
-        }
-
-        // I, J, K, L, M
-        sheet.getCell(row, 8).value = "N/A";
-        sheet.getCell(row, 9).value = "N/A";
-        sheet.getCell(row, 10).value = "N/A";
-        sheet.getCell(row, 11).value = "";
-        sheet.getCell(row, 12).value = "E";
-
-        // Extra cleanup if in RECRUITS
-        if (sheetInfo.name === "RECRUITS") {
-          sheet.getCell(row, 12).value = "";
-          sheet.getCell(row, 13).value = "";
-        }
-
-        await sheet.saveUpdatedCells();
-        return interaction.editReply({
-          content: `✅ Removed **${username}** from ${sheetInfo.name}.`
-        });
-      }
-    }
-  }
-
-  return interaction.editReply({ content: "❌ User not found in any sheet." });
-}
 
 
 // Handle /robloxmanager dropdown actions
