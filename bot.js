@@ -412,9 +412,7 @@ client.on("interactionCreate", async (interaction) => {
               sheet.getCell(row, 5).value = 0;
 
               // --- Always set column G to "12:00:00 AM" ---
-              const gCell = sheet.getCell(row, 6);
-              gCell.numberFormat = 'hh:mm:ss AM/PM';
-              gCell.value = "12:00:00 AM";
+              sheet.getCell(row, 6).value = "12:00:00 AM";
 
               const formulaCell = sheet.getCell(row, 7);
               if (formulaCell.formula) {
