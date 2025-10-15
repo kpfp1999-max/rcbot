@@ -403,39 +403,46 @@ client.on("interactionCreate", async (interaction) => {
           for (const row of [...checkRows, ...altRows]) {
             const cell = sheet.getCell(row, 4); // column E
             if (cell.value === username) {
-              if (checkRows.includes(row)) {
-                cell.value = "-";
-              } else {
-                cell.value = "";
-              }
-
-              sheet.getCell(row, 5).value = 0;
-
-              // --- Always set column G to 12:00:00 AM as a time value ---
-              const gCell = sheet.getCell(row, 6);
-              gCell.value = 0; // 0 means midnight in Google Sheets
-              gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
-
-              const formulaCell = sheet.getCell(row, 7);
-              if (formulaCell.formula) {
-                formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
-              }
-
-              sheet.getCell(row, 8).value = "N/A";
-              sheet.getCell(row, 9).value = "N/A";
-              sheet.getCell(row, 10).value = "N/A";
-              sheet.getCell(row, 11).value = "";
-              sheet.getCell(row, 12).value = "E";
-
               if (sheetInfo.name === "RECRUITS") {
-                sheet.getCell(row, 12).value = "";
-                sheet.getCell(row, 13).value = "";
-              }
+                // Only clear name and M/N columns for RECRUITS
+                cell.value = "";
+                sheet.getCell(row, 12).value = ""; // column M
+                sheet.getCell(row, 13).value = ""; // column N
+                await sheet.saveUpdatedCells();
+                return interaction.editReply({
+                  content: `✅ Removed **${username}** from RECRUITS.`
+                });
+              } else {
+                // Original logic for other sheets
+                if (checkRows.includes(row)) {
+                  cell.value = "-";
+                } else {
+                  cell.value = "";
+                }
 
-              await sheet.saveUpdatedCells();
-              return interaction.editReply({
-                content: `✅ Removed **${username}** from ${sheetInfo.name}.`
-              });
+                sheet.getCell(row, 5).value = 0;
+
+                // --- Always set column G to 0:00 (display) and 12:00:00 AM (formula bar) ---
+                const gCell = sheet.getCell(row, 6);
+                gCell.value = 0; // 0 means midnight in Google Sheets
+                gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
+
+                const formulaCell = sheet.getCell(row, 7);
+                if (formulaCell.formula) {
+                  formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
+                }
+
+                sheet.getCell(row, 8).value = "N/A";
+                sheet.getCell(row, 9).value = "N/A";
+                sheet.getCell(row, 10).value = "N/A";
+                sheet.getCell(row, 11).value = "";
+                sheet.getCell(row, 12).value = "E";
+
+                await sheet.saveUpdatedCells();
+                return interaction.editReply({
+                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`
+                });
+              }
             }
           }
         }
