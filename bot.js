@@ -404,39 +404,52 @@ client.on("interactionCreate", async (interaction) => {
             const cell = sheet.getCell(row, 4); // column E
             if (cell.value === username) {
               if (sheetInfo.name === "RECRUITS") {
-                // Only clear name and M/N columns for RECRUITS
+                // Clear E, M, N
                 cell.value = "";
                 sheet.getCell(row, 12).value = ""; // column M
                 sheet.getCell(row, 13).value = ""; // column N
+                // Uncheck F,G,H,I (columns 5,6,7,8)
+                for (let col = 5; col <= 8; col++) {
+                  sheet.getCell(row, col).value = false;
+                }
                 await sheet.saveUpdatedCells();
                 return interaction.editReply({
                   content: `✅ Removed **${username}** from RECRUITS.`
                 });
-              } else {
-                if (checkRows.includes(row)) {
-                  cell.value = "";
-                  // Do NOT touch column G for checkRows
-                } else {
-                  cell.value = "";
-                  // For altRows, update column G as before
-                  const gCell = sheet.getCell(row, 6);
-                  gCell.value = 0; // 0 means midnight in Google Sheets
-                  gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
-                }
-
-                sheet.getCell(row, 5).value = 0;
-
-                const formulaCell = sheet.getCell(row, 7);
+              } else if (checkRows.includes(row)) {
+                // rows: E cleared, F=0, H formula x=0, I="N/A", J/K="N/A", L="", M="E"
+                cell.value = "";
+                sheet.getCell(row, 5).value = 0; // F
+                const formulaCell = sheet.getCell(row, 7); // H
                 if (formulaCell.formula) {
                   formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
                 }
-
-                sheet.getCell(row, 8).value = "N/A";
-                sheet.getCell(row, 9).value = "N/A";
-                sheet.getCell(row, 10).value = "N/A";
-                sheet.getCell(row, 11).value = "";
-                sheet.getCell(row, 12).value = "E";
-
+                sheet.getCell(row, 8).value = "N/A"; // I
+                sheet.getCell(row, 9).value = "N/A"; // J
+                sheet.getCell(row, 10).value = "N/A"; // K
+                sheet.getCell(row, 11).value = ""; // L
+                sheet.getCell(row, 12).value = "E"; // M
+                await sheet.saveUpdatedCells();
+                return interaction.editReply({
+                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`
+                });
+              } else if (altRows.includes(row)) {
+                // altRows: E cleared, F=0, G logic stays, H formula x=0, I="N/A", J/K="N/A", L="", M="E"
+                cell.value = "";
+                sheet.getCell(row, 5).value = 0; // F
+                // G column logic stays as is
+                const gCell = sheet.getCell(row, 6);
+                gCell.value = 0;
+                gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
+                const formulaCell = sheet.getCell(row, 7); // H
+                if (formulaCell.formula) {
+                  formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
+                }
+                sheet.getCell(row, 8).value = "N/A"; // I
+                sheet.getCell(row, 9).value = "N/A"; // J
+                sheet.getCell(row, 10).value = "N/A"; // K
+                sheet.getCell(row, 11).value = ""; // L
+                sheet.getCell(row, 12).value = "E"; // M
                 await sheet.saveUpdatedCells();
                 return interaction.editReply({
                   content: `✅ Removed **${username}** from ${sheetInfo.name}.`
