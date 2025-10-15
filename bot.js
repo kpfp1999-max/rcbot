@@ -660,7 +660,7 @@ if (action === "remove_user") {
       : [];
 
     for (const row of [...checkRows, ...altRows]) {
-      const cell = sheet.getCell(row, 4); // column D = username
+      const cell = sheet.getCell(row, 4); // column E (0‑based index 4)
       if (cell.value === username) {
         // Name column
         if (checkRows.includes(row)) {
