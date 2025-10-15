@@ -434,13 +434,17 @@ client.on("interactionCreate", async (interaction) => {
                   content: `✅ Removed **${username}** from ${sheetInfo.name}.`
                 });
               } else if (altRows.includes(row)) {
-                // altRows: E cleared, F=0, G logic stays, H formula x=0, I="N/A", J/K="N/A", L="", M="E"
+                // altRows: E cleared, F=0, G logic stays (except CLONE FORCE 99), H formula x=0, I="N/A", J/K="N/A", L="", M="E"
                 cell.value = "";
                 sheet.getCell(row, 5).value = 0; // F
-                // G column logic stays as is
-                const gCell = sheet.getCell(row, 6);
-                gCell.value = 0;
-                gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
+
+                // Only update G column if NOT CLONE FORCE 99
+                if (sheetInfo.name !== "CLONE FORCE 99") {
+                  const gCell = sheet.getCell(row, 6);
+                  gCell.value = 0;
+                  gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
+                }
+
                 const formulaCell = sheet.getCell(row, 7); // H
                 if (formulaCell.formula) {
                   formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
