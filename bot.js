@@ -413,19 +413,18 @@ client.on("interactionCreate", async (interaction) => {
                   content: `✅ Removed **${username}** from RECRUITS.`
                 });
               } else {
-                // Original logic for other sheets
                 if (checkRows.includes(row)) {
-                  cell.value = "-";
+                  cell.value = "";
+                  // Do NOT touch column G for checkRows
                 } else {
                   cell.value = "";
+                  // For altRows, update column G as before
+                  const gCell = sheet.getCell(row, 6);
+                  gCell.value = 0; // 0 means midnight in Google Sheets
+                  gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
                 }
 
                 sheet.getCell(row, 5).value = 0;
-
-                // --- Always set column G to 0:00 (display) and 12:00:00 AM (formula bar) ---
-                const gCell = sheet.getCell(row, 6);
-                gCell.value = 0; // 0 means midnight in Google Sheets
-                gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
 
                 const formulaCell = sheet.getCell(row, 7);
                 if (formulaCell.formula) {
