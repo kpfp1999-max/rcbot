@@ -62,20 +62,55 @@ const _recentSignatures = new Map();
 // TTL for signature cache (ms)
 const SIGNATURE_TTL_MS = 5000;
 
-// Build a concise signature string from a payload object
+// Build a concise signature string from a payload object.
+// Includes content, embed title/description, and a summary of components (customId/placeholder/option labels).
 function signatureFromPayload(payload) {
   if (!payload) return '';
-  // Normalize to object
   let p = payload;
   if (typeof payload === 'string') p = { content: payload };
+
   const parts = [];
-  if (p.content) parts.push(String(p.content).trim());
+
+  if (p.content) {
+    // normalize whitespace and trim length
+    const c = String(p.content).replace(/\s+/g, ' ').trim();
+    if (c) parts.push(c.slice(0, 400));
+  }
+
   if (Array.isArray(p.embeds) && p.embeds.length) {
     const e = p.embeds[0];
-    if (e.title) parts.push(String(e.title).trim());
-    if (e.description) parts.push(String(e.description).trim());
+    if (e.title) parts.push(String(e.title).replace(/\s+/g, ' ').trim().slice(0, 200));
+    if (e.description) parts.push(String(e.description).replace(/\s+/g, ' ').trim().slice(0, 200));
   }
-  // components are often not unique; skip them for signature (content/embeds suffice)
+
+  // components: ActionRow arrays — inspect them for customId / placeholder / options labels
+  if (Array.isArray(p.components) && p.components.length) {
+    try {
+      const compParts = [];
+      for (const row of p.components) {
+        // row might be an object with .components or already raw
+        const comps = row.components ?? row;
+        if (!Array.isArray(comps)) continue;
+        for (const comp of comps) {
+          if (!comp) continue;
+          if (comp.customId) compParts.push(String(comp.customId));
+          else if (comp.placeholder) compParts.push(String(comp.placeholder));
+          else if (Array.isArray(comp.options) && comp.options.length) {
+            // join first few option labels
+            const labels = comp.options.slice(0, 5).map(o => String(o.label || o.value || '').replace(/\s+/g, ' ').trim());
+            compParts.push(labels.join(','));
+          } else if (comp.label) {
+            compParts.push(String(comp.label));
+          }
+        }
+      }
+      if (compParts.length) parts.push(compParts.join('|').slice(0, 400));
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // final signature
   return parts.join('||').slice(0, 1000);
 }
 
@@ -105,11 +140,10 @@ async function findRegisteredMessageForSignature(sig, channelId) {
     if (!ch || !ch.messages) return null;
     const recent = await ch.messages.fetch({ limit: 50 }).catch(() => null);
     if (!recent) return null;
-    // try to find a bot message matching content snippet
+    // try to find a bot message matching content snippet or embed title
     const candidates = recent.filter(m => m.author?.id === client.user?.id);
     for (const m of candidates.values()) {
       if (rec.payloadSummary && (m.content || '').includes(rec.payloadSummary)) return m;
-      // check embed titles too
       const e = m.embeds?.[0];
       if (e && rec.payloadSummary && ((e.title && e.title.includes(rec.payloadSummary)) || (e.description && e.description.includes(rec.payloadSummary)))) {
         return m;
@@ -143,12 +177,7 @@ const _perUserDedupe = new Map();
 const PER_USER_TTL_MS = 3000;
 
 // sendOnce ensures a response with the same key isn't sent twice for the same interaction/user.
-// Behavior:
-//  - If the same interaction object calls sendOnce(key) twice, WeakMap prevents duplicates.
-//  - If a different interaction object (same user) tries the same key shortly after, per-user dedupe prevents duplicates.
-//  - Only marks as sent once the underlying send returned non-null (Message or sentinel).
 async function sendOnce(interaction, key, contentObj) {
-  // If no interaction (caller provided channel explicitly), just send normally
   if (!interaction) {
     const channel = contentObj?.channel || null;
     if (channel && typeof channel.send === 'function') {
@@ -160,7 +189,7 @@ async function sendOnce(interaction, key, contentObj) {
   const userId = interaction.user?.id || (interaction.member && interaction.member.user && interaction.member.user.id) || null;
   const perUserKey = userId ? `${userId}:${key}` : null;
 
-  // Check per-user dedupe first
+  // Per-user dedupe
   if (perUserKey) {
     const now = Date.now();
     const expiry = _perUserDedupe.get(perUserKey);
@@ -170,21 +199,17 @@ async function sendOnce(interaction, key, contentObj) {
     }
   }
 
-  // Check per-interaction weakmap
+  // Per-interaction dedupe (WeakMap)
   let set = _sentOnce.get(interaction);
   if (!set) {
     set = new Set();
     _sentOnce.set(interaction, set);
   }
-  if (set.has(key)) {
-    // Already sent for this interaction object
-    return null;
-  }
+  if (set.has(key)) return null;
 
   // Attempt the send
   const sent = await safeSendAndReturnMessage(interaction, contentObj);
 
-  // If we got something non-null, mark both per-interaction and per-user
   if (sent !== null) {
     try { set.add(key); } catch (e) {}
     if (perUserKey) _perUserDedupe.set(perUserKey, Date.now() + PER_USER_TTL_MS);
@@ -193,68 +218,58 @@ async function sendOnce(interaction, key, contentObj) {
   return sent;
 }
 
-// Tries interaction.reply/editReply -> followUp -> channel.send and returns the resulting Message where available.
-// If an interaction-based send succeeded but fetchReply failed, a sentinel metadata object is returned so cleanup can search for the actual bot message.
+// Tries interaction.reply/editReply -> followUp -> channel.send.
 // This version checks recent signatures and will reuse an existing bot message (or avoid sending) when matching content was posted recently.
+// It also pre-registers a signature before channel.send to avoid races.
 async function safeSendAndReturnMessage(interaction, contentObj = {}) {
-  // Normalize contentObj for channel.send fallback (allow passing a string)
   let payload = contentObj;
   if (typeof contentObj === 'string') payload = { content: contentObj };
 
-  // Compute signature and channel id for dedupe
   const sig = signatureFromPayload(payload);
   const channelId = interaction?.channel?.id || interaction?.message?.channel?.id || null;
 
-  // If a message with same signature was posted recently in this channel, try to return it and just ACK the interaction.
+  // If a message with same signature was posted recently, try to return it and ACK interaction.
   if (sig && channelId) {
     const existing = await findRegisteredMessageForSignature(sig, channelId);
     if (existing) {
-      // Ensure interaction is acknowledged so follow-up/editReply doesn't later post a duplicate.
       try {
         if (!interaction.replied && !interaction.deferred) {
-          // Prefer deferred ephemeral ack when appropriate
           if (typeof interaction.deferReply === 'function') {
-            await interaction.deferReply({ ephemeral: true }).catch(() => {});
+            await interaction.deferReply({ ephemeral: true }).catch(()=>{});
           } else if (typeof interaction.deferUpdate === 'function') {
-            await interaction.deferUpdate().catch(() => {});
+            await interaction.deferUpdate().catch(()=>{});
           }
         }
       } catch (e) {}
-      // Return the found message
       return existing;
     }
   }
 
-  // Helper to build metadata sentinel
-  const makeSentinel = (path) => {
-    return {
-      __sentinel: true,
-      path,
-      channelId,
-      content: payload?.content ?? null,
-      embeds: payload?.embeds ?? null,
-      timestamp: Date.now(),
-    };
-  };
+  const makeSentinel = (path) => ({
+    __sentinel: true,
+    path,
+    channelId,
+    content: payload?.content ?? null,
+    embeds: payload?.embeds ?? null,
+    timestamp: Date.now(),
+  });
 
-  // Try reply/editReply path first
+  // Try reply/editReply first
   try {
     if (interaction && !interaction.replied && !interaction.deferred) {
       try {
         await interaction.reply(payload);
-        // reply accepted. Try to fetch the message for deletion. If fetch fails, register signature and return sentinel.
         try {
           const msg = await interaction.fetchReply();
           console.log('safeSend: used reply -> fetched message');
-          if (sig && channelId) registerSignature(sig, channelId, msg.id, payload?.content?.slice(0, 200) ?? null);
+          if (sig && channelId) registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
           return msg;
         } catch (e) {
           console.log('safeSend: reply succeeded but fetchReply failed; registering signature and returning sentinel', e?.message);
-          if (sig && channelId) registerSignature(sig, channelId, null, payload?.content?.slice(0, 200) ?? null);
+          if (sig && channelId) registerSignature(sig, channelId, null, payload?.content?.slice(0,200) ?? null);
           return makeSentinel('reply_no_fetch');
         }
       } catch (e) {
-        // reply failed, fall through to other methods
         console.log('safeSend: interaction.reply failed, falling through:', e?.message);
       }
     }
@@ -265,11 +280,11 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
         try {
           const msg = await interaction.fetchReply();
           console.log('safeSend: used editReply -> fetched message');
-          if (sig && channelId) registerSignature(sig, channelId, msg.id, payload?.content?.slice(0, 200) ?? null);
+          if (sig && channelId) registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
           return msg;
         } catch (e) {
           console.log('safeSend: editReply succeeded but fetchReply failed; registering signature and returning sentinel', e?.message);
-          if (sig && channelId) registerSignature(sig, channelId, null, payload?.content?.slice(0, 200) ?? null);
+          if (sig && channelId) registerSignature(sig, channelId, null, payload?.content?.slice(0,200) ?? null);
           return makeSentinel('edit_no_fetch');
         }
       } catch (e) {
@@ -277,11 +292,10 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
       }
     }
   } catch (err) {
-    // swallow and fallback
     console.log('safeSend: reply/edit attempt threw, falling back:', err?.message);
   }
 
-  // Try followUp()
+  // Try followUp
   try {
     if (interaction && typeof interaction.followUp === 'function') {
       try {
@@ -300,42 +314,30 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
     console.log('safeSend: followUp threw:', err?.message);
   }
 
-  // Channel fallback: find a channel to send to
+  // Channel fallback: pre-register signature (pending) then send; update with messageId after success
   try {
     const channel = interaction?.channel || interaction?.message?.channel;
     if (channel && typeof channel.send === 'function') {
-      // Before sending, re-check recent signatures in case another parallel path posted while we worked.
       if (sig && channel.id) {
-        const existing2 = await findRegisteredMessageForSignature(sig, channel.id);
-        if (existing2) {
-          // A matching message appeared meanwhile
-          if (sig && channel.id) registerSignature(sig, channel.id, existing2.id, payload?.content?.slice(0,200) ?? null);
-          // ensure interaction acknowledged
-          try {
-            if (!interaction.replied && !interaction.deferred) {
-              if (typeof interaction.deferReply === 'function') await interaction.deferReply({ ephemeral: true }).catch(()=>{});
-              else if (typeof interaction.deferUpdate === 'function') await interaction.deferUpdate().catch(()=>{});
-            }
-          } catch (e) {}
-          return existing2;
-        }
+        // Pre-register so concurrent send attempts see the signature and don't repost
+        registerSignature(sig, channel.id, null, payload?.content?.slice(0,200) ?? null);
+        console.log('safeSend: pre-registered signature before channel.send');
       }
 
+      let sent;
       if (typeof payload === 'object') {
         const sendPayload = {};
         if (payload.content) sendPayload.content = payload.content;
         if (payload.embeds) sendPayload.embeds = payload.embeds;
         if (payload.components) sendPayload.components = payload.components;
-        const sent = await channel.send(sendPayload.content ?? sendPayload);
-        console.log('safeSend: used channel.send fallback');
-        if (sig && channel.id && sent && sent.id) registerSignature(sig, channel.id, sent.id, payload?.content?.slice(0,200) ?? null);
-        return sent;
+        sent = await channel.send(sendPayload.content ?? sendPayload);
       } else {
-        const sent = await channel.send(payload);
-        console.log('safeSend: used channel.send fallback (string payload)');
-        if (sig && channel.id && sent && sent.id) registerSignature(sig, channel.id, sent.id, payload?.content?.slice(0,200) ?? null);
-        return sent;
+        sent = await channel.send(payload);
       }
+
+      console.log('safeSend: used channel.send fallback');
+      if (sig && channel.id && sent && sent.id) registerSignature(sig, channel.id, sent.id, payload?.content?.slice(0,200) ?? null);
+      return sent;
     }
   } catch (err) {
     console.log('safeSend: channel.send fallback failed:', err?.message);
@@ -344,7 +346,7 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
   return null;
 }
 
-// safeReply kept for compatibility (returns void-ish) — prefer safeSendAndReturnMessage when you need the Message object
+// safeReply kept for compatibility
 async function safeReply(interaction, contentObj = {}) {
   await safeSendAndReturnMessage(interaction, contentObj);
   return;
@@ -358,7 +360,6 @@ async function safeUpdate(interaction, updateObj = {}) {
     }
     return await safeSendAndReturnMessage(interaction, updateObj);
   } catch (err) {
-    // fallback to channel.send if needed
     try {
       const channel = interaction?.channel || interaction?.message?.channel;
       if (channel) {
@@ -387,13 +388,11 @@ async function getSheetOrReply(doc, title, interaction) {
 async function safeDeleteMessage(msgOrId, channelContext = null) {
   if (!msgOrId) return;
   try {
-    // If it's a Message object
     if (typeof msgOrId.delete === 'function') {
       await msgOrId.delete().catch(() => {});
       return;
     }
 
-    // If it's a sentinel metadata object returned by safeSendAndReturnMessage (when fetchReply failed)
     if (msgOrId && msgOrId.__sentinel) {
       try {
         const chId = msgOrId.channelId || channelContext?.id;
@@ -401,25 +400,27 @@ async function safeDeleteMessage(msgOrId, channelContext = null) {
         const ch = client.channels.cache.get(chId) || await client.channels.fetch(chId).catch(() => null);
         if (!ch) return;
 
-        // Discord.js v14: check for text-based channel by presence of .messages
         const canFetch = ch?.messages && typeof ch.messages.fetch === 'function';
         if (!canFetch) return;
 
-        // Fetch recent messages and try to find a bot message that matches content or embed title.
+        // try to fetch recent messages and delete match
         const recent = await ch.messages.fetch({ limit: 50 }).catch(() => null);
         if (!recent) return;
         const candidates = recent.filter(m => m.author?.id === client.user?.id);
 
-        // Try to match by exact content first
         if (msgOrId.content) {
           const match = candidates.find(m => (m.content || '').trim() === (msgOrId.content || '').trim());
           if (match) {
             await match.delete().catch(() => {});
+            // remove signature entries that match
+            try {
+              const sig = signatureFromPayload({ content: msgOrId.content, embeds: msgOrId.embeds, components: [] });
+              if (sig) _recentSignatures.delete(sig);
+            } catch (e) {}
             return;
           }
         }
 
-        // Try to match by embed content/title if available
         if (msgOrId.embeds && msgOrId.embeds.length) {
           for (const m of candidates.values()) {
             const e = m.embeds?.[0];
@@ -427,24 +428,26 @@ async function safeDeleteMessage(msgOrId, channelContext = null) {
             if ((e.title && msgOrId.embeds[0]?.title && e.title === msgOrId.embeds[0].title) ||
                 (e.description && msgOrId.embeds[0]?.description && e.description === msgOrId.embeds[0].description)) {
               await m.delete().catch(() => {});
+              try {
+                const sig = signatureFromPayload({ content: msgOrId.content, embeds: msgOrId.embeds, components: [] });
+                if (sig) _recentSignatures.delete(sig);
+              } catch (e) {}
               return;
             }
           }
         }
 
-        // No exact match — don't delete aggressively; return.
         return;
       } catch (e) {
         return;
       }
     }
 
-    // If it's { id, channel } we can delete directly
     if (msgOrId.id && msgOrId.channel) {
       await msgOrId.channel.messages.delete(msgOrId.id).catch(() => {});
       return;
     }
-    // If it's an id and we have a channel context, try to fetch then delete
+
     if (typeof msgOrId === 'string' && channelContext) {
       try {
         const fetched = await channelContext.messages.fetch(msgOrId);
@@ -487,7 +490,6 @@ async function cleanupAndLog({
   componentMessages = [],
   logText = ''
 }) {
-  // Flatten and attempt deletes. If we only have ids, try to use interaction.channel as context.
   const channelContext = interaction?.channel || interaction?.message?.channel || null;
 
   const all = [
@@ -662,12 +664,12 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
-    // --- tracker_action_ and rc_action_ handlers (flows unchanged, use safe helpers) ---
-    // (handlers unchanged; they call sendOnce/safeSend functions above)
+    // I preserved your handlers from earlier — they call sendOnce/safeSend functions above,
+    // so the new dedupe/signature logic applies to them.
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("tracker_action_") || interaction.customId.startsWith("rc_action_"))) {
-      // delegate to existing code paths above (kept same as your previous file)
-      // For brevity in this file I keep the same handler logic as earlier; it's still calling sendOnce(...)
-      // (Full handlers are present earlier in the file - unchanged)
+      // Your existing select handlers (unchanged logic) will run in the rest of this handler.
+      // For brevity here we rely on the earlier full implementation you already have in your file.
+      // Ensure your file includes the full handler bodies (as in previous versions).
     }
   } catch (err) {
     console.error("Unhandled interaction error:", err);
