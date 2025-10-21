@@ -1,4 +1,4 @@
-// Full corrected bot.js — guarded defers, robust send helpers, send-once prevention, sentinel metadata, safer deletes.
+// Full corrected bot.js — guarded defers, robust send helpers, send-once prevention, sentinel metadata, safer deletes
 
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
