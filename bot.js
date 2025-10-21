@@ -60,26 +60,64 @@ async function safeGetCell(sheet, row, col) {
 // WeakMap to avoid sending the same logical response twice for an interaction
 const _sentOnce = new WeakMap();
 
-// sendOnce ensures a response with the same key isn't sent twice for the same interaction
-// NOTE: will mark the key as sent only if the underlying send operation returned non-null
+// Per-user dedupe map to prevent duplicates across different Interaction objects.
+// key: `${userId}:${key}` -> expiry timestamp (ms)
+// TTL is short to avoid blocking legitimate repeated commands; adjust if needed.
+const _perUserDedupe = new Map();
+const PER_USER_TTL_MS = 3000;
+
+// sendOnce ensures a response with the same key isn't sent twice for the same interaction/user.
+// Behavior:
+//  - If the same interaction object calls sendOnce(key) twice, WeakMap prevents duplicates.
+//  - If a different interaction object (same user) tries the same key shortly after, per-user dedupe prevents duplicates.
+//  - Only marks as sent once the underlying send returned non-null (Message or sentinel).
 async function sendOnce(interaction, key, contentObj) {
+  // If no interaction (caller provided channel explicitly), just send normally
   if (!interaction) {
-    // if no interaction, just send to channel if possible
     const channel = contentObj?.channel || null;
     if (channel && typeof channel.send === 'function') {
       return channel.send(contentObj.content || contentObj);
     }
     return null;
   }
+
+  const userId = interaction.user?.id || (interaction.member && interaction.member.user && interaction.member.user.id) || null;
+  const perUserKey = userId ? `${userId}:${key}` : null;
+
+  // Check per-user dedupe first
+  if (perUserKey) {
+    const now = Date.now();
+    const expiry = _perUserDedupe.get(perUserKey);
+    if (expiry && expiry > now) {
+      console.log(`sendOnce: blocked by per-user dedupe for ${perUserKey}`);
+      return null;
+    }
+  }
+
+  // Check per-interaction weakmap
   let set = _sentOnce.get(interaction);
   if (!set) {
     set = new Set();
     _sentOnce.set(interaction, set);
   }
-  if (set.has(key)) return null;
+  if (set.has(key)) {
+    // Already sent for this interaction object
+    return null;
+  }
 
+  // Attempt the send
   const sent = await safeSendAndReturnMessage(interaction, contentObj);
-  if (sent !== null) set.add(key);
+
+  // If we got something non-null, mark both per-interaction and per-user
+  if (sent !== null) {
+    try {
+      set.add(key);
+    } catch (e) {}
+    if (perUserKey) {
+      _perUserDedupe.set(perUserKey, Date.now() + PER_USER_TTL_MS);
+    }
+  }
+
   return sent;
 }
 
@@ -110,15 +148,15 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
         // reply accepted. Try to fetch the message for deletion. If fetch fails, return sentinel.
         try {
           const msg = await interaction.fetchReply();
-          console.debug('safeSend: used reply -> fetched message');
+          console.log('safeSend: used reply -> fetched message');
           return msg;
         } catch (e) {
-          console.debug('safeSend: reply succeeded but fetchReply failed; returning sentinel', e?.message);
+          console.log('safeSend: reply succeeded but fetchReply failed; returning sentinel', e?.message);
           return makeSentinel('reply_no_fetch');
         }
       } catch (e) {
         // reply failed, fall through to other methods
-        console.debug('safeSend: interaction.reply failed, falling through:', e?.message);
+        console.log('safeSend: interaction.reply failed, falling through:', e?.message);
       }
     }
 
@@ -127,19 +165,19 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
         await interaction.editReply(payload);
         try {
           const msg = await interaction.fetchReply();
-          console.debug('safeSend: used editReply -> fetched message');
+          console.log('safeSend: used editReply -> fetched message');
           return msg;
         } catch (e) {
-          console.debug('safeSend: editReply succeeded but fetchReply failed; returning sentinel', e?.message);
+          console.log('safeSend: editReply succeeded but fetchReply failed; returning sentinel', e?.message);
           return makeSentinel('edit_no_fetch');
         }
       } catch (e) {
-        console.debug('safeSend: interaction.editReply failed, falling through:', e?.message);
+        console.log('safeSend: interaction.editReply failed, falling through:', e?.message);
       }
     }
   } catch (err) {
     // swallow and fallback
-    console.debug('safeSend: reply/edit attempt threw, falling back:', err?.message);
+    console.log('safeSend: reply/edit attempt threw, falling back:', err?.message);
   }
 
   // Try followUp()
@@ -147,14 +185,14 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
     if (interaction && typeof interaction.followUp === 'function') {
       try {
         const follow = await interaction.followUp(payload);
-        console.debug('safeSend: used followUp');
+        console.log('safeSend: used followUp');
         return follow ?? makeSentinel('followup_no_message');
       } catch (e) {
-        console.debug('safeSend: followUp failed, falling through:', e?.message);
+        console.log('safeSend: followUp failed, falling through:', e?.message);
       }
     }
   } catch (err) {
-    console.debug('safeSend: followUp threw:', err?.message);
+    console.log('safeSend: followUp threw:', err?.message);
   }
 
   // Channel fallback: find a channel to send to
@@ -167,16 +205,16 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
         if (payload.embeds) sendPayload.embeds = payload.embeds;
         if (payload.components) sendPayload.components = payload.components;
         const sent = await channel.send(sendPayload.content ?? sendPayload);
-        console.debug('safeSend: used channel.send fallback');
+        console.log('safeSend: used channel.send fallback');
         return sent;
       } else {
         const sent = await channel.send(payload);
-        console.debug('safeSend: used channel.send fallback (string payload)');
+        console.log('safeSend: used channel.send fallback (string payload)');
         return sent;
       }
     }
   } catch (err) {
-    console.debug('safeSend: channel.send fallback failed:', err?.message);
+    console.log('safeSend: channel.send fallback failed:', err?.message);
   }
 
   return null;
