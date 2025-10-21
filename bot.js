@@ -1,4 +1,4 @@
-// Full corrected bot.js — guarded defers, robust send helpers, send-once prevention, signature dedupe, sentinel metadata, safer deletes
+// Full working bot.js — restored handlers, stronger defers, dedupe + duplicate-removal, modal inputs, cleanup & log
 
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -14,6 +14,9 @@ const {
   EmbedBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require("discord.js");
 const noblox = require("noblox.js");
 const fetch = require("node-fetch");
@@ -26,6 +29,8 @@ console.log("Env present:", {
   GOOGLE_CLIENT_EMAIL: !!process.env.GOOGLE_CLIENT_EMAIL,
   GOOGLE_PRIVATE_KEY: !!process.env.GOOGLE_PRIVATE_KEY,
   SPREADSHEET_ID: !!process.env.SPREADSHEET_ID,
+  ROBLOX_COOKIE: !!process.env.ROBLOX_COOKIE,
+  BOT_LOG_CHANNEL_ID: !!process.env.BOT_LOG_CHANNEL_ID,
 });
 
 // Discord client
@@ -60,7 +65,7 @@ async function safeGetCell(sheet, row, col) {
 // signature -> { channelId, messageId (optional), expiresAt, payloadSummary }
 const _recentSignatures = new Map();
 // TTL for signature cache (ms)
-const SIGNATURE_TTL_MS = 5000;
+const SIGNATURE_TTL_MS = 8000; // slightly larger window
 
 // Build a concise signature string from a payload object.
 // Includes content, embed title/description, and a summary of components (customId/placeholder/option labels).
@@ -88,7 +93,6 @@ function signatureFromPayload(payload) {
     try {
       const compParts = [];
       for (const row of p.components) {
-        // row might be an object with .components or already raw
         const comps = row.components ?? row;
         if (!Array.isArray(comps)) continue;
         for (const comp of comps) {
@@ -96,7 +100,6 @@ function signatureFromPayload(payload) {
           if (comp.customId) compParts.push(String(comp.customId));
           else if (comp.placeholder) compParts.push(String(comp.placeholder));
           else if (Array.isArray(comp.options) && comp.options.length) {
-            // join first few option labels
             const labels = comp.options.slice(0, 5).map(o => String(o.label || o.value || '').replace(/\s+/g, ' ').trim());
             compParts.push(labels.join(','));
           } else if (comp.label) {
@@ -105,9 +108,7 @@ function signatureFromPayload(payload) {
         }
       }
       if (compParts.length) parts.push(compParts.join('|').slice(0, 400));
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
   }
 
   // final signature
@@ -129,10 +130,8 @@ async function findRegisteredMessageForSignature(sig, channelId) {
       if (!ch || !ch.messages) return null;
       const msg = await ch.messages.fetch(rec.messageId).catch(() => null);
       if (msg) return msg;
-      return null;
-    } catch {
-      return null;
-    }
+    } catch {}
+    return null;
   }
   // no messageId but signature exists (sentinel-only) — attempt to find a recent message matching summary
   try {
@@ -140,7 +139,6 @@ async function findRegisteredMessageForSignature(sig, channelId) {
     if (!ch || !ch.messages) return null;
     const recent = await ch.messages.fetch({ limit: 50 }).catch(() => null);
     if (!recent) return null;
-    // try to find a bot message matching content snippet or embed title
     const candidates = recent.filter(m => m.author?.id === client.user?.id);
     for (const m of candidates.values()) {
       if (rec.payloadSummary && (m.content || '').includes(rec.payloadSummary)) return m;
@@ -166,6 +164,24 @@ function registerSignature(sig, channelId, messageId = null, payloadSummary = nu
   } catch {}
 }
 
+async function deleteRegisteredMessageBySig(sig, channelId, exceptMessageId = null) {
+  const rec = _recentSignatures.get(sig);
+  if (!rec) return;
+  if (rec.channelId !== channelId) return;
+  if (!rec.messageId) return;
+  if (rec.messageId === exceptMessageId) {
+    // same message, nothing to do
+    return;
+  }
+  try {
+    const ch = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
+    if (!ch || !ch.messages) return;
+    await ch.messages.delete(rec.messageId).catch(()=>{});
+  } catch (e) {}
+  // remove entry afterward
+  _recentSignatures.delete(sig);
+}
+
 // ---------- Robust interaction/channel sending helpers ----------
 
 // WeakMap to avoid sending the same logical response twice for an interaction
@@ -174,9 +190,8 @@ const _sentOnce = new WeakMap();
 // Per-user dedupe map to prevent duplicates across different Interaction objects.
 // key: `${userId}:${key}` -> expiry timestamp (ms)
 const _perUserDedupe = new Map();
-const PER_USER_TTL_MS = 3000;
+const PER_USER_TTL_MS = 8000;
 
-// sendOnce ensures a response with the same key isn't sent twice for the same interaction/user.
 async function sendOnce(interaction, key, contentObj) {
   if (!interaction) {
     const channel = contentObj?.channel || null;
@@ -189,7 +204,6 @@ async function sendOnce(interaction, key, contentObj) {
   const userId = interaction.user?.id || (interaction.member && interaction.member.user && interaction.member.user.id) || null;
   const perUserKey = userId ? `${userId}:${key}` : null;
 
-  // Per-user dedupe
   if (perUserKey) {
     const now = Date.now();
     const expiry = _perUserDedupe.get(perUserKey);
@@ -199,7 +213,6 @@ async function sendOnce(interaction, key, contentObj) {
     }
   }
 
-  // Per-interaction dedupe (WeakMap)
   let set = _sentOnce.get(interaction);
   if (!set) {
     set = new Set();
@@ -207,7 +220,6 @@ async function sendOnce(interaction, key, contentObj) {
   }
   if (set.has(key)) return null;
 
-  // Attempt the send
   const sent = await safeSendAndReturnMessage(interaction, contentObj);
 
   if (sent !== null) {
@@ -219,8 +231,7 @@ async function sendOnce(interaction, key, contentObj) {
 }
 
 // Tries interaction.reply/editReply -> followUp -> channel.send.
-// This version checks recent signatures and will reuse an existing bot message (or avoid sending) when matching content was posted recently.
-// It also pre-registers a signature before channel.send to avoid races.
+// Prevents duplicates by checking signatures and deletes older channel.send when later interaction reply succeeds.
 async function safeSendAndReturnMessage(interaction, contentObj = {}) {
   let payload = contentObj;
   if (typeof contentObj === 'string') payload = { content: contentObj };
@@ -262,7 +273,11 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
         try {
           const msg = await interaction.fetchReply();
           console.log('safeSend: used reply -> fetched message');
-          if (sig && channelId) registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
+          if (sig && channelId) {
+            registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
+            // If there was a previous channel.send with same signature, delete it
+            try { await deleteRegisteredMessageBySig(sig, channelId, msg.id); } catch (e) {}
+          }
           return msg;
         } catch (e) {
           console.log('safeSend: reply succeeded but fetchReply failed; registering signature and returning sentinel', e?.message);
@@ -280,7 +295,10 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
         try {
           const msg = await interaction.fetchReply();
           console.log('safeSend: used editReply -> fetched message');
-          if (sig && channelId) registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
+          if (sig && channelId) {
+            registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
+            try { await deleteRegisteredMessageBySig(sig, channelId, msg.id); } catch (e) {}
+          }
           return msg;
         } catch (e) {
           console.log('safeSend: editReply succeeded but fetchReply failed; registering signature and returning sentinel', e?.message);
@@ -302,8 +320,12 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
         const follow = await interaction.followUp(payload);
         console.log('safeSend: used followUp');
         if (sig && channelId) {
-          if (follow && follow.id) registerSignature(sig, channelId, follow.id, payload?.content?.slice(0,200) ?? null);
-          else registerSignature(sig, channelId, null, payload?.content?.slice(0,200) ?? null);
+          if (follow && follow.id) {
+            registerSignature(sig, channelId, follow.id, payload?.content?.slice(0,200) ?? null);
+            try { await deleteRegisteredMessageBySig(sig, channelId, follow.id); } catch (e) {}
+          } else {
+            registerSignature(sig, channelId, null, payload?.content?.slice(0,200) ?? null);
+          }
         }
         return follow ?? makeSentinel('followup_no_message');
       } catch (e) {
@@ -319,7 +341,6 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
     const channel = interaction?.channel || interaction?.message?.channel;
     if (channel && typeof channel.send === 'function') {
       if (sig && channel.id) {
-        // Pre-register so concurrent send attempts see the signature and don't repost
         registerSignature(sig, channel.id, null, payload?.content?.slice(0,200) ?? null);
         console.log('safeSend: pre-registered signature before channel.send');
       }
@@ -403,7 +424,6 @@ async function safeDeleteMessage(msgOrId, channelContext = null) {
         const canFetch = ch?.messages && typeof ch.messages.fetch === 'function';
         if (!canFetch) return;
 
-        // try to fetch recent messages and delete match
         const recent = await ch.messages.fetch({ limit: 50 }).catch(() => null);
         if (!recent) return;
         const candidates = recent.filter(m => m.author?.id === client.user?.id);
@@ -412,7 +432,6 @@ async function safeDeleteMessage(msgOrId, channelContext = null) {
           const match = candidates.find(m => (m.content || '').trim() === (msgOrId.content || '').trim());
           if (match) {
             await match.delete().catch(() => {});
-            // remove signature entries that match
             try {
               const sig = signatureFromPayload({ content: msgOrId.content, embeds: msgOrId.embeds, components: [] });
               if (sig) _recentSignatures.delete(sig);
@@ -452,14 +471,10 @@ async function safeDeleteMessage(msgOrId, channelContext = null) {
       try {
         const fetched = await channelContext.messages.fetch(msgOrId);
         if (fetched) await fetched.delete().catch(() => {});
-      } catch (e) {
-        // can't fetch or delete
-      }
+      } catch (e) {}
       return;
     }
-  } catch (e) {
-    // ignore
-  }
+  } catch (e) {}
 }
 
 // get log channel (env BOT_LOG_CHANNEL_ID or cfg.logChannelId)
@@ -531,7 +546,7 @@ async function cleanupAndLog({
   }
 })();
 
-// Register slash commands (same as before)
+// Register slash commands
 const commands = [
   new SlashCommandBuilder()
     .setName("robloxmanager")
@@ -557,12 +572,39 @@ const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   }
 })();
 
-// --- SINGLE interactionCreate handler (flows unchanged but use safe helpers) ---
+// --- SINGLE interactionCreate handler (restored flows + early defers) ---
 client.on("interactionCreate", async (interaction) => {
   try {
+    // --- EARLY DEFERRAL: prevents token expiry races that cause 10062 Unknown interaction ---
+    if (interaction.isChatInputCommand()) {
+      try {
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.deferReply({ ephemeral: false }).catch((e) => {
+            console.log('early deferReply failed (safe to ignore):', e?.message);
+          });
+        }
+      } catch (e) {
+        console.log('deferReply outer catch:', e?.message);
+      }
+    }
+    if (interaction.isStringSelectMenu() || interaction.isButton() || interaction.isModalSubmit()) {
+      try {
+        if (!interaction.replied && !interaction.deferred && interaction.type !== 5 /* MODAL SUBMIT is not deferred the same way */) {
+          if (interaction.isStringSelectMenu() || interaction.isButton()) {
+            await interaction.deferUpdate().catch((e) => {
+              console.log('early deferUpdate failed (safe to ignore):', e?.message);
+            });
+          }
+        }
+      } catch (e) {
+        console.log('deferUpdate outer catch:', e?.message);
+      }
+    }
+    // --- end early deferral ---
+
     // Chat input commands
     if (interaction.isChatInputCommand()) {
-      const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+      const isAdmin = interaction.member?.permissions?.has?.(PermissionsBitField.Flags.Administrator);
       if (!isAdmin) {
         await safeReply(interaction, { content: "❌ Administrator permission required.", ephemeral: true });
         return;
@@ -579,7 +621,6 @@ client.on("interactionCreate", async (interaction) => {
               { label: "Accept Join Request", value: "accept_join" },
             ])
         );
-        // Use sendOnce to avoid duplicates
         await sendOnce(interaction, 'rc_menu', { content: "Choose an action:", components: [row] });
         return;
       }
@@ -620,7 +661,7 @@ client.on("interactionCreate", async (interaction) => {
 
           const groups = Array.isArray(groupsJson.data) ? groupsJson.data : [];
           const totalGroups = groups.length;
-          const importantGroupIds = [34808935, 34794384, 35250103, 35335293, 5232591, 34755744];
+          const importantGroupIds = cfg.importantGroupIds ?? [34808935, 34794384, 35250103, 35335293, 5232591, 34755744];
           const matchedKeyGroups = groups
             .filter((g) => importantGroupIds.includes(Number(g.group.id)))
             .map((g) => `${g.group.name} — ${g.role?.name ?? "Member"}`);
@@ -664,12 +705,327 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
-    // I preserved your handlers from earlier — they call sendOnce/safeSend functions above,
-    // so the new dedupe/signature logic applies to them.
+    // Handle string select menus for rc_action_... and tracker_action_...
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("tracker_action_") || interaction.customId.startsWith("rc_action_"))) {
-      // Your existing select handlers (unchanged logic) will run in the rest of this handler.
-      // For brevity here we rely on the earlier full implementation you already have in your file.
-      // Ensure your file includes the full handler bodies (as in previous versions).
+      // ensure only the original user interacts
+      const parts = interaction.customId.split('_');
+      const tailUserId = parts[parts.length - 1];
+      if (tailUserId !== interaction.user.id) {
+        await safeReply(interaction, { content: "❌ This menu is not for you.", ephemeral: true });
+        return;
+      }
+
+      const value = interaction.values && interaction.values[0];
+      if (!value) {
+        await safeReply(interaction, { content: "❌ No option selected.", ephemeral: true });
+        return;
+      }
+
+      // RC actions
+      if (interaction.customId.startsWith("rc_action_")) {
+        if (value === "change_rank") {
+          const modal = new ModalBuilder()
+            .setCustomId(`rc_modal_changeRank_${interaction.user.id}`)
+            .setTitle('Change Rank');
+          const usernameInput = new TextInputBuilder().setCustomId('username').setLabel('Roblox username').setStyle(TextInputStyle.Short).setRequired(true);
+          const rankInput = new TextInputBuilder().setCustomId('rank').setLabel('Rank name or number').setStyle(TextInputStyle.Short).setRequired(true);
+          modal.addComponents(new ActionRowBuilder().addComponents(usernameInput), new ActionRowBuilder().addComponents(rankInput));
+          await interaction.showModal(modal).catch((e) => {
+            console.log('showModal failed:', e?.message);
+            safeReply(interaction, { content: '❌ Failed to show modal.', ephemeral: true });
+          });
+          return;
+        }
+        if (value === "kick_user") {
+          const modal = new ModalBuilder()
+            .setCustomId(`rc_modal_kick_${interaction.user.id}`)
+            .setTitle('Kick User');
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('username').setLabel('Roblox username').setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('reason').setLabel('Reason (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)
+            )
+          );
+          await interaction.showModal(modal).catch((e) => {
+            console.log('showModal failed:', e?.message);
+            safeReply(interaction, { content: '❌ Failed to show modal.', ephemeral: true });
+          });
+          return;
+        }
+        if (value === "accept_join") {
+          const modal = new ModalBuilder()
+            .setCustomId(`rc_modal_accept_${interaction.user.id}`)
+            .setTitle('Accept Join Request');
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('username').setLabel('Roblox username').setStyle(TextInputStyle.Short).setRequired(true)
+            )
+          );
+          await interaction.showModal(modal).catch((e) => {
+            console.log('showModal failed:', e?.message);
+            safeReply(interaction, { content: '❌ Failed to show modal.', ephemeral: true });
+          });
+          return;
+        }
+      }
+
+      // Tracker actions
+      if (interaction.customId.startsWith("tracker_action_")) {
+        if (value === "add_placement") {
+          const modal = new ModalBuilder()
+            .setCustomId(`tracker_modal_add_${interaction.user.id}`)
+            .setTitle('Add Placement');
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('username').setLabel('Player username').setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('placement').setLabel('Placement (e.g. Recruit, Sgt)').setStyle(TextInputStyle.Short).setRequired(true)
+            )
+          );
+          await interaction.showModal(modal).catch((e) => {
+            console.log('showModal failed:', e?.message);
+            safeReply(interaction, { content: '❌ Failed to show modal.', ephemeral: true });
+          });
+          return;
+        }
+        if (value === "promote_placement") {
+          const modal = new ModalBuilder()
+            .setCustomId(`tracker_modal_promote_${interaction.user.id}`)
+            .setTitle('Promote Placement');
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('username').setLabel('Player username').setStyle(TextInputStyle.Short).setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('newplacement').setLabel('New placement').setStyle(TextInputStyle.Short).setRequired(true)
+            )
+          );
+          await interaction.showModal(modal).catch((e) => {
+            console.log('showModal failed:', e?.message);
+            safeReply(interaction, { content: '❌ Failed to show modal.', ephemeral: true });
+          });
+          return;
+        }
+        if (value === "remove_user") {
+          const modal = new ModalBuilder()
+            .setCustomId(`tracker_modal_remove_${interaction.user.id}`)
+            .setTitle('Remove from Tracker');
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('username').setLabel('Player username').setStyle(TextInputStyle.Short).setRequired(true)
+            )
+          );
+          await interaction.showModal(modal).catch((e) => {
+            console.log('showModal failed:', e?.message);
+            safeReply(interaction, { content: '❌ Failed to show modal.', ephemeral: true });
+          });
+          return;
+        }
+      }
+    }
+
+    // Handle modal submissions
+    if (interaction.isModalSubmit()) {
+      // Ensure modal was intended for this user
+      const modalId = interaction.customId;
+      if (modalId.includes(`_${interaction.user.id}`) === false) {
+        await safeReply(interaction, { content: "❌ This modal isn't for you.", ephemeral: true });
+        return;
+      }
+
+      // RC - change rank
+      if (modalId.startsWith('rc_modal_changeRank_')) {
+        const username = interaction.fields.getTextInputValue('username').trim();
+        const rankInput = interaction.fields.getTextInputValue('rank').trim();
+        await safeReply(interaction, { content: `Processing change rank for ${username}...`, ephemeral: true });
+
+        let logText = '';
+        try {
+          if (!cfg.groupId) throw new Error('cfg.groupId is missing');
+          const userId = await noblox.getIdFromUsername(username);
+          // Try interpret rank as number first, else try to find role by name
+          let rankNumber = parseInt(rankInput, 10);
+          if (isNaN(rankNumber)) {
+            const roles = await noblox.getRoles(cfg.groupId);
+            const match = roles.find(r => r.name.toLowerCase() === rankInput.toLowerCase());
+            if (!match) throw new Error('Rank not found by name');
+            rankNumber = match.rank;
+          }
+          await noblox.setRank(cfg.groupId, userId, rankNumber);
+          logText = `Completed: Changed rank for ${username} to ${rankInput}`;
+          await safeReply(interaction, { content: `✅ Rank changed for ${username} to ${rankInput}`, ephemeral: true });
+        } catch (err) {
+          console.error('changeRank error:', err);
+          logText = `Failed: Change rank for ${username} — ${err.message || err}`;
+          await safeReply(interaction, { content: `❌ Failed to change rank: ${err.message || err}`, ephemeral: true });
+        }
+
+        // Attempt to delete any menu message (the select) and log
+        try {
+          // find the menu message in the channel by signature
+          const sig = signatureFromPayload({ content: "Choose an action:" });
+          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
+          await cleanupAndLog({
+            interaction,
+            userMessages: [],
+            botMessages: [],
+            menuMessage: menuMsg,
+            componentMessages: [],
+            logText
+          });
+        } catch (e) {}
+        return;
+      }
+
+      // RC - kick
+      if (modalId.startsWith('rc_modal_kick_')) {
+        const username = interaction.fields.getTextInputValue('username').trim();
+        const reason = interaction.fields.getTextInputValue('reason')?.trim() || 'No reason provided';
+        await safeReply(interaction, { content: `Processing kick for ${username}...`, ephemeral: true });
+
+        let logText = '';
+        try {
+          if (!cfg.groupId) throw new Error('cfg.groupId is missing');
+          const userId = await noblox.getIdFromUsername(username);
+          await noblox.exile(cfg.groupId, userId);
+          logText = `Completed: Kicked ${username} (${reason})`;
+          await safeReply(interaction, { content: `✅ Kicked ${username}`, ephemeral: true });
+        } catch (err) {
+          console.error('kick error:', err);
+          logText = `Failed: Kick ${username} — ${err.message || err}`;
+          await safeReply(interaction, { content: `❌ Failed to kick: ${err.message || err}`, ephemeral: true });
+        }
+
+        try {
+          const sig = signatureFromPayload({ content: "Choose an action:" });
+          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
+          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
+        } catch (e) {}
+        return;
+      }
+
+      // RC - accept join
+      if (modalId.startsWith('rc_modal_accept_')) {
+        const username = interaction.fields.getTextInputValue('username').trim();
+        await safeReply(interaction, { content: `Processing accept join for ${username}...`, ephemeral: true });
+
+        let logText = '';
+        try {
+          if (!cfg.groupId) throw new Error('cfg.groupId is missing');
+          const userId = await noblox.getIdFromUsername(username);
+          // Attempt to accept join requests (noblox method may vary)
+          if (typeof noblox.handleJoinRequest === 'function') {
+            await noblox.handleJoinRequest(cfg.groupId, userId, true);
+            logText = `Completed: Accepted join request for ${username}`;
+            await safeReply(interaction, { content: `✅ Accepted join for ${username}`, ephemeral: true });
+          } else {
+            // fallback: set rank to default 1
+            await noblox.setRank(cfg.groupId, userId, 1);
+            logText = `Completed (fallback): Set rank 1 for ${username}`;
+            await safeReply(interaction, { content: `✅ Accepted (fallback) for ${username}`, ephemeral: true });
+          }
+        } catch (err) {
+          console.error('accept join error:', err);
+          logText = `Failed: Accept join for ${username} — ${err.message || err}`;
+          await safeReply(interaction, { content: `❌ Failed to accept: ${err.message || err}`, ephemeral: true });
+        }
+
+        try {
+          const sig = signatureFromPayload({ content: "Choose an action:" });
+          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
+          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
+        } catch (e) {}
+        return;
+      }
+
+      // Tracker modals
+      if (modalId.startsWith('tracker_modal_add_')) {
+        const username = interaction.fields.getTextInputValue('username').trim();
+        const placement = interaction.fields.getTextInputValue('placement').trim();
+        await safeReply(interaction, { content: `Adding ${username} to tracker...`, ephemeral: true });
+
+        let logText = '';
+        try {
+          const sheet = await getSheetOrReply(sheetDoc, 'Tracker', interaction);
+          if (!sheet) throw new Error('Tracker sheet missing');
+          await sheet.addRow({ Username: username, Placement: placement, Date: (new Date()).toISOString() });
+          logText = `Completed: Added ${username} as ${placement}`;
+          await safeReply(interaction, { content: `✅ Added ${username} as ${placement}`, ephemeral: true });
+        } catch (err) {
+          console.error('tracker add error:', err);
+          logText = `Failed: Add ${username} — ${err.message || err}`;
+          await safeReply(interaction, { content: `❌ Failed to add: ${err.message || err}`, ephemeral: true });
+        }
+
+        try {
+          const sig = signatureFromPayload({ content: "Choose a tracker action" });
+          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
+          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
+        } catch (e) {}
+        return;
+      }
+
+      if (modalId.startsWith('tracker_modal_promote_')) {
+        const username = interaction.fields.getTextInputValue('username').trim();
+        const newplacement = interaction.fields.getTextInputValue('newplacement').trim();
+        await safeReply(interaction, { content: `Promoting ${username}...`, ephemeral: true });
+
+        let logText = '';
+        try {
+          const sheet = await getSheetOrReply(sheetDoc, 'Tracker', interaction);
+          if (!sheet) throw new Error('Tracker sheet missing');
+          const rows = await sheet.getRows();
+          const row = rows.find(r => String(r.Username || '').toLowerCase() === username.toLowerCase());
+          if (!row) throw new Error('User not found in tracker');
+          row.Placement = newplacement;
+          row.Date = (new Date()).toISOString();
+          await row.save();
+          logText = `Completed: Promoted ${username} to ${newplacement}`;
+          await safeReply(interaction, { content: `✅ Promoted ${username} to ${newplacement}`, ephemeral: true });
+        } catch (err) {
+          console.error('tracker promote error:', err);
+          logText = `Failed: Promote ${username} — ${err.message || err}`;
+          await safeReply(interaction, { content: `❌ Failed to promote: ${err.message || err}`, ephemeral: true });
+        }
+
+        try {
+          const sig = signatureFromPayload({ content: "Choose a tracker action" });
+          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
+          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
+        } catch (e) {}
+        return;
+      }
+
+      if (modalId.startsWith('tracker_modal_remove_')) {
+        const username = interaction.fields.getTextInputValue('username').trim();
+        await safeReply(interaction, { content: `Removing ${username} from tracker...`, ephemeral: true });
+
+        let logText = '';
+        try {
+          const sheet = await getSheetOrReply(sheetDoc, 'Tracker', interaction);
+          if (!sheet) throw new Error('Tracker sheet missing');
+          const rows = await sheet.getRows();
+          const row = rows.find(r => String(r.Username || '').toLowerCase() === username.toLowerCase());
+          if (!row) throw new Error('User not found in tracker');
+          await row.delete();
+          logText = `Completed: Removed ${username} from tracker`;
+          await safeReply(interaction, { content: `✅ Removed ${username} from tracker`, ephemeral: true });
+        } catch (err) {
+          console.error('tracker remove err:', err);
+          logText = `Failed: Remove ${username} — ${err.message || err}`;
+          await safeReply(interaction, { content: `❌ Failed to remove: ${err.message || err}`, ephemeral: true });
+        }
+
+        try {
+          const sig = signatureFromPayload({ content: "Choose a tracker action" });
+          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
+          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
+        } catch (e) {}
+        return;
+      }
     }
   } catch (err) {
     console.error("Unhandled interaction error:", err);
@@ -679,9 +1035,7 @@ client.on("interactionCreate", async (interaction) => {
       } else {
         await safeSendAndReturnMessage(interaction, { content: "❌ An internal error occurred.", components: [] });
       }
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
   }
 });
 
