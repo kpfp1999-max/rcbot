@@ -1,4 +1,4 @@
-// Updated: robust safeReply/safeUpdate wrappers to avoid "Unknown interaction" errors.
+// Full corrected bot.js — guarded defers and robust safeReply/safeUpdate fallbacks.
 
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -55,26 +55,146 @@ async function safeGetCell(sheet, row, col) {
   return sheet.getCell(row, col);
 }
 
+// safeReply & safeUpdate — robust wrappers used everywhere below
+async function safeReply(interaction, contentObj = {}) {
+  try {
+    if (!interaction) return null;
+    if (!interaction.replied && !interaction.deferred) {
+      return await interaction.reply(contentObj);
+    }
+    return await interaction.editReply(contentObj);
+  } catch (err) {
+    // fallback to followUp, then channel.send
+    try {
+      if (interaction && typeof interaction.followUp === 'function') {
+        return await interaction.followUp(contentObj);
+      }
+    } catch (err2) {
+      // continue to channel fallback
+    }
+    try {
+      const channel = interaction?.channel || interaction?.message?.channel;
+      if (channel) {
+        const body = (typeof contentObj === 'object' && contentObj.content) ? contentObj.content : contentObj;
+        console.warn('safeReply: falling back to channel.send (interaction token likely expired).');
+        return await channel.send(body);
+      }
+    } catch (err3) {
+      // nothing else to do
+    }
+    return null;
+  }
+}
+
+async function safeUpdate(interaction, updateObj = {}) {
+  try {
+    if (interaction && typeof interaction.update === 'function') {
+      return await interaction.update(updateObj);
+    }
+    // fallback to safeReply if update isn't available
+    return await safeReply(interaction, updateObj);
+  } catch (err) {
+    // fallback to channel send for Unknown interaction
+    if (err && (err.code === 10062 || err.status === 404)) {
+      try {
+        const channel = interaction?.channel || interaction?.message?.channel;
+        if (channel) {
+          const body = (typeof updateObj === 'object' && updateObj.content) ? updateObj.content : updateObj;
+          console.warn('safeUpdate: falling back to channel.send (interaction token likely expired).');
+          return await channel.send(body);
+        }
+      } catch (e) {}
+      return null;
+    }
+    throw err;
+  }
+}
+
 // Sheet lookup helper (existence guard).
 // Returns the sheet or null after replying to the interaction.
 async function getSheetOrReply(doc, title, interaction) {
   if (!doc) {
-    try {
-      await safeReply(interaction, { content: '❌ Google Sheets not initialized yet', ephemeral: true });
-    } catch (e) {}
+    try { await safeReply(interaction, { content: '❌ Google Sheets not initialized yet', ephemeral: true }); } catch (e) {}
     return null;
   }
   const sheet = doc.sheetsByTitle[title];
   if (!sheet) {
-    try {
-      await safeReply(interaction, { content: `❌ Sheet "${title}" not found`, ephemeral: true });
-    } catch (e) {}
+    try { await safeReply(interaction, { content: `❌ Sheet "${title}" not found`, ephemeral: true }); } catch (e) {}
     return null;
   }
   return sheet;
 }
 
-// Roblox cookie init
+// best-effort delete helper
+async function safeDeleteMessage(msg) {
+  if (!msg) return;
+  try {
+    if (typeof msg.delete === 'function') {
+      await msg.delete().catch(() => {});
+      return;
+    }
+    if (msg.id && msg.channel) {
+      await msg.channel.messages.delete(msg.id).catch(() => {});
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+// get log channel (env BOT_LOG_CHANNEL_ID or cfg.logChannelId)
+async function getLogChannel() {
+  const id = process.env.BOT_LOG_CHANNEL_ID || (cfg && cfg.logChannelId);
+  if (!id) return null;
+  try {
+    return client.channels.cache.get(id) || await client.channels.fetch(id);
+  } catch (e) {
+    return null;
+  }
+}
+
+/*
+  cleanupAndLog options:
+    - interaction: the Interaction object (required)
+    - userMessages: array of user Message objects to delete
+    - botMessages: array of bot Message objects to delete
+    - menuMessage: the original menu message (interaction.message or menuMessage)
+    - componentMessages: array of component messages (like select.message)
+    - logText: string to send to log channel (can include mention <@userid>)
+*/
+async function cleanupAndLog({
+  interaction,
+  userMessages = [],
+  botMessages = [],
+  menuMessage = null,
+  componentMessages = [],
+  logText = ''
+}) {
+  const all = [
+    ...userMessages.filter(Boolean),
+    ...botMessages.filter(Boolean),
+    ...(menuMessage ? [menuMessage] : []),
+    ...componentMessages.filter(Boolean),
+  ];
+
+  await Promise.all(all.map(m => safeDeleteMessage(m)));
+
+  const logChannel = await getLogChannel();
+  if (!logChannel) {
+    console.warn('BOT_LOG_CHANNEL_ID not set or channel not found; skipping log send.');
+    return;
+  }
+
+  try {
+    const content = (logText && typeof logText === 'string')
+      ? `<@${interaction.user.id}> — ${logText}`
+      : `<@${interaction.user.id}> performed an action.`;
+    await logChannel.send({ content });
+  } catch (err) {
+    console.error('Failed to send log message:', err);
+  }
+}
+
+// --- Roblox cookie init ---
 (async () => {
   try {
     if (process.env.ROBLOX_COOKIE) {
@@ -117,152 +237,12 @@ const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   }
 })();
 
-// Helper for safe replies (reply vs editReply)
-// kept for compatibility; safeReply below is preferred for robust flows
-async function confirm(interaction, msg) {
-  return safeReply(interaction, { content: msg });
-}
-
-// safeReply: robust reply/edit/fallback to avoid "Unknown interaction"
-async function safeReply(interaction, contentObj = {}) {
-  try {
-    // keep behavior: if not replied and not deferred, try reply()
-    if (!interaction.replied && !interaction.deferred) {
-      return await interaction.reply(contentObj);
-    }
-    // prefer editReply if we've deferred or already replied
-    return await interaction.editReply(contentObj);
-  } catch (err) {
-    // If the interaction is unknown or expired, try followUp, then channel fallback
-    try {
-      return await interaction.followUp(contentObj);
-    } catch (err2) {
-      try {
-        const channel = interaction.channel || (interaction.message && interaction.message.channel);
-        if (channel) {
-          // if contentObj is an object with content, send that; otherwise try to send the string directly
-          const body = (typeof contentObj === 'object' && contentObj.content) ? contentObj.content : contentObj;
-          return await channel.send(body);
-        }
-      } catch (err3) {
-        // last resort: nothing to do
-        return null;
-      }
-    }
-  }
-}
-
-// safeUpdate: for component interactions where update() is intended.
-// If update fails (Unknown interaction) this will fallback to channel send.
-async function safeUpdate(interaction, updateObj = {}) {
-  try {
-    if (typeof interaction.update === 'function') {
-      return await interaction.update(updateObj);
-    }
-    // If no update function (not a component), fallback to safeReply
-    return await safeReply(interaction, updateObj);
-  } catch (err) {
-    // If Discord says Unknown interaction -> fallback to channel send
-    if (err && (err.code === 10062 || err.status === 404)) {
-      try {
-        const channel = interaction.channel || (interaction.message && interaction.message.channel);
-        if (channel) {
-          const body = (typeof updateObj === 'object' && updateObj.content) ? updateObj.content : updateObj;
-          return await channel.send(body);
-        }
-      } catch (e) {
-        // ignore
-      }
-      return null;
-    }
-    // otherwise rethrow so calling code can handle
-    throw err;
-  }
-}
-
-// best-effort delete helper
-async function safeDeleteMessage(msg) {
-  if (!msg) return;
-  try {
-    // If it's a Message object
-    if (typeof msg.delete === 'function') {
-      await msg.delete().catch(() => {});
-      return;
-    }
-    // fallback: if we have id and channel
-    if (msg.id && msg.channel) {
-      await msg.channel.messages.delete(msg.id).catch(() => {});
-    }
-  } catch (e) {
-    // ignore
-  }
-}
-
-// get log channel (env BOT_LOG_CHANNEL_ID or cfg.logChannelId)
-async function getLogChannel() {
-  const id = process.env.BOT_LOG_CHANNEL_ID || (cfg && cfg.logChannelId);
-  if (!id) return null;
-  try {
-    return client.channels.cache.get(id) || await client.channels.fetch(id);
-  } catch (e) {
-    return null;
-  }
-}
-
-/*
-  cleanupAndLog options:
-    - interaction: the Interaction object (required)
-    - userMessages: array of user Message objects to delete
-    - botMessages: array of bot Message objects to delete
-    - menuMessage: the original menu message (interaction.message or menuMessage)
-    - componentMessages: array of component messages (like select.message)
-    - logText: string to send to log channel (can include mention <@userid>)
-*/
-async function cleanupAndLog({
-  interaction,
-  userMessages = [],
-  botMessages = [],
-  menuMessage = null,
-  componentMessages = [],
-  logText = ''
-}) {
-  // flatten and unique
-  const all = [
-    ...userMessages.filter(Boolean),
-    ...botMessages.filter(Boolean),
-    ...(menuMessage ? [menuMessage] : []),
-    ...componentMessages.filter(Boolean),
-  ];
-
-  // Parallel best-effort deletes
-  await Promise.all(all.map(m => safeDeleteMessage(m)));
-
-  // Send a log message (ping the acting user)
-  const logChannel = await getLogChannel();
-  if (!logChannel) {
-    console.warn('BOT_LOG_CHANNEL_ID not set or channel not found; skipping log send.');
-    return;
-  }
-
-  try {
-    const content = (logText && typeof logText === 'string')
-      ? `<@${interaction.user.id}> — ${logText}`
-      : `<@${interaction.user.id}> performed an action.`;
-    await logChannel.send({ content });
-  } catch (err) {
-    console.error('Failed to send log message:', err);
-  }
-}
-
 // --- SINGLE interactionCreate handler ---
 client.on("interactionCreate", async (interaction) => {
   try {
     // --- Slash commands ---
     if (interaction.isChatInputCommand()) {
-      // Admin check
-      const isAdmin = interaction.member.permissions.has(
-        PermissionsBitField.Flags.Administrator
-      );
+      const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
       if (!isAdmin) {
         return safeReply(interaction, { content: "❌ Administrator permission required.", ephemeral: true });
       }
@@ -314,7 +294,6 @@ client.on("interactionCreate", async (interaction) => {
           const friendsCount = friendsJson.count ?? 0;
           const followersCount = followersJson.count ?? 0;
           const followingCount = followingJson.count ?? 0;
-          const inventoryPublic = Boolean(invJson.canViewInventory);
           const avatarUrl = avatarJson.data?.[0]?.imageUrl || null;
 
           const groups = Array.isArray(groupsJson.data) ? groupsJson.data : [];
@@ -339,40 +318,7 @@ client.on("interactionCreate", async (interaction) => {
             )
             .setColor(0x00ae86);
 
-          // --- Fetch all badges via /badges endpoint ---
-          let allBadges = [];
-          let cursor = "";
-          do {
-            const res = await fetch(
-              `https://badges.roblox.com/v1/users/${userId}/badges?limit=100&sortOrder=Asc${cursor ? `&cursor=${cursor}` : ""}`
-            );
-            const page = await res.json();
-            if (!page.data) break;
-            allBadges.push(...page.data);
-            cursor = page.nextPageCursor;
-          } while (cursor);
-
-          const totalBadges = allBadges.length;
-          const suspectedCount = allBadges.filter((b) => {
-            const lower = (b.name || "").toLowerCase();
-            return lower.includes("free") || lower.includes("badge");
-          }).length;
-          const adjustedBadgeTotal = Math.max(0, totalBadges - suspectedCount);
-
-          embed.addFields(
-            { name: "Total Badges", value: String(totalBadges), inline: true },
-            { name: "Suspected Bot Badges", value: String(suspectedCount), inline: true },
-            { name: "Total Badges (Adjusted)", value: String(adjustedBadgeTotal), inline: true }
-          );
-
-          const badgeRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setStyle(ButtonStyle.Link)
-              .setLabel("View All Badges")
-              .setURL(`https://www.roblox.com/users/${userId}/inventory/#!/badges`)
-          );
-
-          await safeReply(interaction, { embeds: [embed], components: [badgeRow] });
+          await safeReply(interaction, { embeds: [embed] });
         } catch (err) {
           console.error(err);
           await safeReply(interaction, { content: "❌ Error fetching data." });
@@ -404,8 +350,16 @@ client.on("interactionCreate", async (interaction) => {
 
       const action = interaction.values[0];
 
-      // We will wait → defer to avoid token expiry
-      await interaction.deferReply({ ephemeral: true });
+      // Guarded defer: try deferReply, if it fails continue and fall back to safeReply
+      let trackerDeferred = false;
+      try {
+        await interaction.deferReply({ ephemeral: true });
+        trackerDeferred = true;
+      } catch (err) {
+        console.warn("tracker select: deferReply failed — falling back to channel replies:", err?.code, err?.message);
+        // continue; safeReply will fall back to channel.send when necessary
+      }
+
       await safeReply(interaction, { content: `Enter the username for **${action.replace("_", " ")}**:`, components: [] });
 
       const filter = (m) => m.author.id === interaction.user.id;
@@ -440,18 +394,18 @@ client.on("interactionCreate", async (interaction) => {
 
         let inserted = false;
         for (let row = 11; row <= 31; row++) {
-          const cell = recruits.getCell(row, 4); // Column E (0-index)
+          const cell = recruits.getCell(row, 4);
           if (!cell.value) {
             cell.value = username;
-            recruits.getCell(row, 12).value = startDate; // Column M (0-index)
-            recruits.getCell(row, 13).value = endDate;   // Column N (0-index)
+            recruits.getCell(row, 12).value = startDate;
+            recruits.getCell(row, 13).value = endDate;
             await recruits.saveUpdatedCells();
 
             await safeReply(interaction, { content: `✅ Added **${username}** to RECRUITS with dates.`, components: [] });
 
             const botReply = await interaction.fetchReply().catch(() => null);
-            const userMsg = collected?.first ? collected.first() : null; // username message
-            const dateMsgObj = dateMsg?.first ? dateMsg.first() : null; // dates message
+            const userMsg = collected?.first ? collected.first() : null;
+            const dateMsgObj = dateMsg?.first ? dateMsg.first() : null;
             await cleanupAndLog({
               interaction,
               userMessages: [userMsg, dateMsgObj],
@@ -498,11 +452,8 @@ client.on("interactionCreate", async (interaction) => {
             cell.value = username;
             await commandos.saveUpdatedCells();
 
-            // Clear recruit row fields
             recruits.getCell(foundRow, 4).value = "";
-            for (let col = 5; col <= 8; col++) {
-              recruits.getCell(foundRow, col).value = false;
-            }
+            for (let col = 5; col <= 8; col++) recruits.getCell(foundRow, col).value = false;
             recruits.getCell(foundRow, 12).value = "";
             recruits.getCell(foundRow, 13).value = "";
 
@@ -560,18 +511,14 @@ client.on("interactionCreate", async (interaction) => {
             : [];
 
           for (const row of [...checkRows, ...altRows]) {
-            const cell = sheet.getCell(row, 4); // column E
+            const cell = sheet.getCell(row, 4); // E
             if (cell.value === username) {
               foundAnywhere = true;
-              // Handle RECRUITS special case
               if (sheetInfo.name === "RECRUITS") {
-                // Clear E, M, N and uncheck F,G,H,I
                 cell.value = "";
-                sheet.getCell(row, 12).value = ""; // column M
-                sheet.getCell(row, 13).value = ""; // column N
-                for (let col = 5; col <= 8; col++) {
-                  sheet.getCell(row, col).value = false;
-                }
+                sheet.getCell(row, 12).value = "";
+                sheet.getCell(row, 13).value = "";
+                for (let col = 5; col <= 8; col++) sheet.getCell(row, col).value = false;
                 await sheet.saveUpdatedCells();
 
                 await safeReply(interaction, { content: `✅ Removed **${username}** from RECRUITS.`, components: [] });
@@ -587,19 +534,16 @@ client.on("interactionCreate", async (interaction) => {
                 return;
               }
 
-              // For primary rows region (checkRows)
               if (checkRows.includes(row)) {
                 cell.value = "";
-                sheet.getCell(row, 5).value = 0; // F
-                const formulaCell = sheet.getCell(row, 7); // H
-                if (formulaCell.formula) {
-                  formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
-                }
-                sheet.getCell(row, 8).value = "N/A"; // I
-                sheet.getCell(row, 9).value = "N/A"; // J
-                sheet.getCell(row, 10).value = "N/A"; // K
-                sheet.getCell(row, 11).value = ""; // L
-                sheet.getCell(row, 12).value = "E"; // M
+                sheet.getCell(row, 5).value = 0;
+                const formulaCell = sheet.getCell(row, 7);
+                if (formulaCell.formula) formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
+                sheet.getCell(row, 8).value = "N/A";
+                sheet.getCell(row, 9).value = "N/A";
+                sheet.getCell(row, 10).value = "N/A";
+                sheet.getCell(row, 11).value = "";
+                sheet.getCell(row, 12).value = "E";
                 await sheet.saveUpdatedCells();
 
                 await safeReply(interaction, { content: `✅ Removed **${username}** from ${sheetInfo.name}.`, components: [] });
@@ -615,32 +559,21 @@ client.on("interactionCreate", async (interaction) => {
                 return;
               }
 
-              // For altRows region
               if (altRows.includes(row)) {
                 cell.value = "";
-                sheet.getCell(row, 5).value = 0; // F
-
-                // Only update G column if NOT CLONE FORCE 99
+                sheet.getCell(row, 5).value = 0;
                 if (sheetInfo.name !== "CLONE FORCE 99") {
-                  const gCell = sheet.getCell(row, 6); // G
-                  // Set numeric zero to represent midnight and set numberFormat to TIME
+                  const gCell = sheet.getCell(row, 6);
                   gCell.value = 0;
-                  try {
-                    gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
-                  } catch (e) {
-                    // ignore if API doesn't accept this property
-                  }
+                  try { gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' }; } catch (e) {}
                 }
-
-                const formulaCell = sheet.getCell(row, 7); // H
-                if (formulaCell.formula) {
-                  formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
-                }
-                sheet.getCell(row, 8).value = "N/A"; // I
-                sheet.getCell(row, 9).value = "N/A"; // J
-                sheet.getCell(row, 10).value = "N/A"; // K
-                sheet.getCell(row, 11).value = ""; // L
-                sheet.getCell(row, 12).value = "E"; // M
+                const formulaCell = sheet.getCell(row, 7);
+                if (formulaCell.formula) formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
+                sheet.getCell(row, 8).value = "N/A";
+                sheet.getCell(row, 9).value = "N/A";
+                sheet.getCell(row, 10).value = "N/A";
+                sheet.getCell(row, 11).value = "";
+                sheet.getCell(row, 12).value = "E";
                 await sheet.saveUpdatedCells();
 
                 await safeReply(interaction, { content: `✅ Removed **${username}** from ${sheetInfo.name}.`, components: [] });
@@ -664,7 +597,6 @@ client.on("interactionCreate", async (interaction) => {
         }
       }
 
-      // --- Default ---
       await safeReply(interaction, { content: `⚠️ Action **${action}** not yet implemented.`, components: [] });
     }
 
@@ -682,7 +614,24 @@ client.on("interactionCreate", async (interaction) => {
 
       const action = interaction.values[0];
       const groupId = 35335293;
-      await interaction.deferReply();
+
+      // Guarded defer: try deferReply; if it fails attempt deferUpdate, else continue
+      let rcDeferred = false;
+      try {
+        await interaction.deferReply();
+        rcDeferred = true;
+      } catch (err) {
+        console.warn("rc_action_: deferReply failed — trying deferUpdate or falling back:", err?.code, err?.message);
+        try {
+          if (typeof interaction.deferUpdate === 'function') {
+            await interaction.deferUpdate();
+            rcDeferred = true;
+          }
+        } catch (err2) {
+          console.warn("rc_action_: deferUpdate also failed:", err2?.code, err2?.message);
+        }
+      }
+
       const menuMessage = interaction.message;
 
       // ---------------- CHANGE RANK ----------------
@@ -872,25 +821,24 @@ async function initSheets() {
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
 
-  // Construct doc. Newer google-spreadsheet versions accept auth via second param.
   const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, auth);
   await doc.loadInfo();
   console.log('✅ Google Sheets connected:', doc.title);
-  sheetDoc = doc; // save globally
+  sheetDoc = doc;
   return doc;
 }
 
 // --- Startup sequence ---
 (async () => {
   try {
-    await initSheets();                  // sets sheetDoc
+    await initSheets();
     await client.login(process.env.DISCORD_TOKEN);
   } catch (err) {
     console.error('❌ Startup error:', err);
   }
 })();
 
-// Optional: basic error handlers to avoid crashing on unhandled rejections
+// Optional: basic error handlers
 client.on('error', (err) => {
   console.error('Discord client error:', err);
 });
