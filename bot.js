@@ -1,4 +1,4 @@
-// bot.js — full file — fixes: safe fetch polyfill, use flags for ephemeral replies, bgc robust replies
+// bot.js — updated: safe fetch polyfill + sendEphemeral + minimal bgc fix
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const {
@@ -20,7 +20,6 @@ const express = require('express');
 // --- Safe fetch polyfill (only defines global fetch when missing) ---
 if (typeof globalThis.fetch !== 'function') {
   try {
-    // try CommonJS require
     const _nf = require('node-fetch');
     globalThis.fetch = _nf && _nf.default ? _nf.default : _nf;
   } catch (e) {
@@ -84,7 +83,7 @@ async function getSheetOrReply(doc, title, interaction) {
   if (!doc) {
     try {
       if (!interaction.deferred && !interaction.replied) {
-        await sendEphemeral(interaction, { content: '❌ Google Sheets not initialized yet' });
+        await interaction.reply({ content: '❌ Google Sheets not initialized yet', ephemeral: true });
       } else {
         await interaction.followUp({ content: '❌ Google Sheets not initialized yet', ephemeral: true });
       }
@@ -97,7 +96,7 @@ async function getSheetOrReply(doc, title, interaction) {
   if (!sheet) {
     try {
       if (!interaction.deferred && !interaction.replied) {
-        await sendEphemeral(interaction, { content: `❌ Sheet "${title}" not found` });
+        await interaction.reply({ content: `❌ Sheet "${title}" not found`, ephemeral: true });
       } else {
         await interaction.followUp({ content: `❌ Sheet "${title}" not found`, ephemeral: true });
       }
@@ -167,32 +166,20 @@ async function confirm(interaction, msg) {
 
 // best-effort delete helper
 async function safeDeleteMessage(msg) {
-  if (!msg) return false;
+  if (!msg) return;
   try {
     // If it's a Message object
     if (typeof msg.delete === 'function') {
       await msg.delete().catch(() => {});
-      return true;
+      return;
     }
     // fallback: if we have id and channel
-    if (msg.id && msg.channel && msg.channel.messages && typeof msg.channel.messages.delete === 'function') {
+    if (msg.id && msg.channel) {
       await msg.channel.messages.delete(msg.id).catch(() => {});
-      return true;
-    }
-    // if it's an object with id and channelId
-    if (msg.id && msg.channelId) {
-      try {
-        const ch = await client.channels.fetch(msg.channelId);
-        if (ch && ch.messages) {
-          await ch.messages.delete(msg.id).catch(() => {});
-          return true;
-        }
-      } catch (e) {}
     }
   } catch (e) {
     // ignore
   }
-  return false;
 }
 
 // get log channel (env BOT_LOG_CHANNEL_ID or cfg.logChannelId)
@@ -261,7 +248,10 @@ client.on("interactionCreate", async (interaction) => {
         PermissionsBitField.Flags.Administrator
       );
       if (!isAdmin) {
-        return sendEphemeral(interaction, { content: "❌ Administrator permission required." });
+        return interaction.reply({
+          content: "❌ Administrator permission required.",
+          ephemeral: true,
+        });
       }
 
       // /robloxmanager
@@ -276,7 +266,7 @@ client.on("interactionCreate", async (interaction) => {
               { label: "Accept Join Request", value: "accept_join" },
             ])
         );
-        return sendEphemeral(interaction, { content: "Choose an action:", components: [row] });
+        return interaction.reply({ content: "Choose an action:", components: [row] });
       }
 
       // /bgc
@@ -284,33 +274,29 @@ client.on("interactionCreate", async (interaction) => {
         const username = interaction.options.getString("username");
         // use sendEphemeral to avoid deprecated ephemeral option warning
         await sendEphemeral(interaction, { content: "🔎 Fetching Roblox data…" });
-
         try {
-          // Ensure fetch exists and is callable (polyfill above sets globalThis.fetch)
-          if (typeof globalThis.fetch !== 'function') throw new Error('fetch not available');
-
-          const userRes = await globalThis.fetch("https://users.roblox.com/v1/usernames/users", {
+          const userRes = await fetch("https://users.roblox.com/v1/usernames/users", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ usernames: [username] }),
           });
           const userJson = await userRes.json();
           if (!userJson.data?.length) {
-            return interaction.editReply({ content: `❌ Could not find Roblox user **${username}**`, components: [] });
+            return interaction.editReply(`❌ Could not find Roblox user **${username}**`);
           }
           const userId = userJson.data[0].id;
 
           const [info, friendsJson, followersJson, followingJson, invJson, avatarJson, groupsJson] =
             await Promise.all([
-              globalThis.fetch(`https://users.roblox.com/v1/users/${userId}`).then((r) => r.json()),
-              globalThis.fetch(`https://friends.roblox.com/v1/users/${userId}/friends/count`).then((r) => r.json()),
-              globalThis.fetch(`https://friends.roblox.com/v1/users/${userId}/followers/count`).then((r) => r.json()),
-              globalThis.fetch(`https://friends.roblox.com/v1/users/${userId}/followings/count`).then((r) => r.json()),
-              globalThis.fetch(`https://inventory.roblox.com/v1/users/${userId}/can-view-inventory`).then((r) => r.json()),
-              globalThis.fetch(
+              fetch(`https://users.roblox.com/v1/users/${userId}`).then((r) => r.json()),
+              fetch(`https://friends.roblox.com/v1/users/${userId}/friends/count`).then((r) => r.json()),
+              fetch(`https://friends.roblox.com/v1/users/${userId}/followers/count`).then((r) => r.json()),
+              fetch(`https://friends.roblox.com/v1/users/${userId}/followings/count`).then((r) => r.json()),
+              fetch(`https://inventory.roblox.com/v1/users/${userId}/can-view-inventory`).then((r) => r.json()),
+              fetch(
                 `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=150x150&format=Png&isCircular=false`
               ).then((r) => r.json()),
-              globalThis.fetch(`https://groups.roblox.com/v2/users/${userId}/groups/roles`).then((r) => r.json()),
+              fetch(`https://groups.roblox.com/v2/users/${userId}/groups/roles`).then((r) => r.json()),
             ]);
 
           const friendsCount = friendsJson.count ?? 0;
@@ -345,7 +331,7 @@ client.on("interactionCreate", async (interaction) => {
           let allBadges = [];
           let cursor = "";
           do {
-            const res = await globalThis.fetch(
+            const res = await fetch(
               `https://badges.roblox.com/v1/users/${userId}/badges?limit=100&sortOrder=Asc${cursor ? `&cursor=${cursor}` : ""}`
             );
             const page = await res.json();
@@ -377,21 +363,7 @@ client.on("interactionCreate", async (interaction) => {
           await interaction.editReply({ embeds: [embed], components: [badgeRow] });
         } catch (err) {
           console.error(err);
-          // If initial reply wasn't successfully sent, use sendEphemeral as fallback
-          try {
-            if (!interaction.replied && !interaction.deferred) {
-              await sendEphemeral(interaction, { content: "❌ Error fetching data." });
-            } else {
-              await interaction.editReply({ content: "❌ Error fetching data.", components: [] });
-            }
-          } catch (e) {
-            try { await interaction.followUp({ content: "❌ Error fetching data.", ephemeral: true }); } catch (_) {}
-          }
-          // send error to log channel and ping user
-          try {
-            const logChannel = await getLogChannel();
-            if (logChannel) await logChannel.send({ content: `<@${interaction.user.id}> ❌ Error fetching data. \`\`\`${String(err).slice(0,1900)}\`\`\`` });
-          } catch (_) {}
+          try { await interaction.editReply("❌ Error fetching data."); } catch (e) { try { await interaction.followUp("❌ Error fetching data."); } catch (_) {} }
         }
       }
 
@@ -412,23 +384,22 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     // --- Dropdowns: tracker manager ---
-    if (interaction.isStringSelectMenu() && interaction.customId && interaction.customId.startsWith("tracker_action_")) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("tracker_action_")) {
       const actionUserId = interaction.customId.split("_").at(-1);
       if (actionUserId !== interaction.user.id) {
-        return sendEphemeral(interaction, { content: "❌ Only the original user can use this menu." });
+        return interaction.reply({
+          content: "❌ Only the original user can use this menu.",
+          ephemeral: true
+        });
       }
 
       const action = interaction.values[0];
 
       // Update the menu message to ask for username
-      try {
-        await interaction.update({
-          content: `Enter the username for **${action.replace("_", " ")}**:`,
-          components: []
-        });
-      } catch (e) {
-        try { await sendEphemeral(interaction, { content: `Enter the username for **${action.replace("_", " ")}**:` }); } catch(_) {}
-      }
+      await interaction.update({
+        content: `Enter the username for **${action.replace("_", " ")}**:`,
+        components: []
+      });
 
       const filter = (m) => m.author.id === interaction.user.id;
       const collected = await interaction.channel.awaitMessages({
@@ -437,22 +408,23 @@ client.on("interactionCreate", async (interaction) => {
         time: 30000
       });
       if (!collected.size) {
-        try { await interaction.editReply({ content: "⏳ Timed out." }); } catch(_) {}
-        return;
+        return interaction.editReply({ content: "⏳ Timed out." });
       }
       const username = collected.first().content.trim();
 
       // ---------------- ADD PLACEMENT ----------------
       if (action === "add_placement") {
-        try { await interaction.editReply({ content: `Enter two dates for **${username}** in format: XX/XX/XX XX/XX/XX` }); } catch(_) {}
+        await interaction.editReply({
+          content: `Enter two dates for **${username}** in format: XX/XX/XX XX/XX/XX`
+        });
+
         const dateMsg = await interaction.channel.awaitMessages({
           filter,
           max: 1,
           time: 30000
         });
         if (!dateMsg.size) {
-          try { await interaction.editReply({ content: "⏳ Timed out." }); } catch(_) {}
-          return;
+          return interaction.editReply({ content: "⏳ Timed out." });
         }
 
         const [startDate, endDate] = dateMsg.first().content.trim().split(" ");
@@ -470,7 +442,10 @@ client.on("interactionCreate", async (interaction) => {
             recruits.getCell(row, 13).value = endDate;   // Column N (0-index)
             await recruits.saveUpdatedCells();
 
-            try { await interaction.editReply({ content: `✅ Added **${username}** to RECRUITS with dates.`, components: [] }); } catch(_) {}
+            await interaction.editReply({
+              content: `✅ Added **${username}** to RECRUITS with dates.`,
+              components: []
+            });
 
             const botReply = await interaction.fetchReply().catch(() => null);
             const userMsg = collected?.first ? collected.first() : null; // username message
@@ -488,7 +463,9 @@ client.on("interactionCreate", async (interaction) => {
           }
         }
         if (!inserted) {
-          try { await interaction.editReply({ content: "❌ No empty slot found in RECRUITS." }); } catch(_) {}
+          return interaction.editReply({
+            content: "❌ No empty slot found in RECRUITS."
+          });
         }
         return;
       }
@@ -511,8 +488,7 @@ client.on("interactionCreate", async (interaction) => {
           }
         }
         if (!foundRow) {
-          try { await interaction.editReply({ content: "❌ User not found in RECRUITS." }); } catch(_) {}
-          return;
+          return interaction.editReply({ content: "❌ User not found in RECRUITS." });
         }
 
         let promoted = false;
@@ -532,7 +508,7 @@ client.on("interactionCreate", async (interaction) => {
 
             await recruits.saveUpdatedCells();
 
-            try { await interaction.editReply({ content: `✅ Promoted **${username}** to COMMANDOS.`, components: [] }); } catch(_) {}
+            await interaction.editReply({ content: `✅ Promoted **${username}** to COMMANDOS.`, components: [] });
             const botReply = await interaction.fetchReply().catch(() => null);
             const userMsg = collected?.first ? collected.first() : null; // if you collected username earlier
             await cleanupAndLog({
@@ -548,7 +524,7 @@ client.on("interactionCreate", async (interaction) => {
           }
         }
         if (!promoted) {
-          try { await interaction.editReply({ content: "❌ No empty slot in COMMANDOS." }); } catch(_) {}
+          return interaction.editReply({ content: "❌ No empty slot in COMMANDOS." });
         }
         return;
       }
@@ -598,7 +574,10 @@ client.on("interactionCreate", async (interaction) => {
                 }
                 await sheet.saveUpdatedCells();
 
-                try { await interaction.editReply({ content: `✅ Removed **${username}** from RECRUITS.`, components: [] }); } catch(_) {}
+                await interaction.editReply({
+                  content: `✅ Removed **${username}** from RECRUITS.`,
+                  components: []
+                });
                 const botReply = await interaction.fetchReply().catch(() => null);
                 const userMsg = collected?.first ? collected.first() : null;
                 await cleanupAndLog({
@@ -626,7 +605,10 @@ client.on("interactionCreate", async (interaction) => {
                 sheet.getCell(row, 12).value = "E"; // M
                 await sheet.saveUpdatedCells();
 
-                try { await interaction.editReply({ content: `✅ Removed **${username}** from ${sheetInfo.name}.`, components: [] }); } catch(_) {}
+                await interaction.editReply({
+                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`,
+                  components: []
+                });
                 const botReply = await interaction.fetchReply().catch(() => null);
                 const userMsg = collected?.first ? collected.first() : null;
                 await cleanupAndLog({
@@ -651,7 +633,7 @@ client.on("interactionCreate", async (interaction) => {
                   try {
                     gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
                   } catch (e) {
-                    // ignore
+                    // ignore if API rejects
                   }
                 }
 
@@ -666,7 +648,10 @@ client.on("interactionCreate", async (interaction) => {
                 sheet.getCell(row, 12).value = "E"; // M
                 await sheet.saveUpdatedCells();
 
-                try { await interaction.editReply({ content: `✅ Removed **${username}** from ${sheetInfo.name}.`, components: [] }); } catch(_) {}
+                await interaction.editReply({
+                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`,
+                  components: []
+                });
                 const botReply = await interaction.fetchReply().catch(() => null);
                 const userMsg = collected?.first ? collected.first() : null;
                 await cleanupAndLog({
@@ -683,29 +668,32 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         if (!foundAnywhere) {
-          try { await interaction.editReply({ content: "❌ User not found in any sheet." }); } catch(_) {}
+          return interaction.editReply({ content: "❌ User not found in any sheet." });
         }
       }
 
       // --- Default ---
-      try { await interaction.editReply({ content: `⚠️ Action **${action}** not yet implemented.`, components: [] }); } catch(_) {}
+      await interaction.editReply({
+        content: `⚠️ Action **${action}** not yet implemented.`,
+        components: []
+      });
     }
 
     // --- Dropdowns: roblox manager ---
-    if (interaction.isStringSelectMenu() && interaction.customId && interaction.customId.startsWith("rc_action_")) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rc_action_")) {
       const actionUserId = interaction.customId.split("_").at(-1);
       if (actionUserId !== interaction.user.id) {
-        return sendEphemeral(interaction, { content: "❌ Only the original user can use this menu." });
+        return interaction.reply({ content: "❌ Only the original user can use this menu.", ephemeral: true });
       }
 
       const isAdmin = interaction.member?.permissions?.has(PermissionsBitField.Flags.Administrator);
       if (!isAdmin) {
-        return sendEphemeral(interaction, { content: "❌ Administrator permission required." });
+        return interaction.reply({ content: "❌ Administrator permission required.", ephemeral: true });
       }
 
       const action = interaction.values[0];
       const groupId = 35335293;
-      try { await interaction.deferReply(); } catch(_) {}
+      await interaction.deferReply();
       const menuMessage = interaction.message;
 
       // ---------------- CHANGE RANK ----------------
@@ -835,11 +823,6 @@ client.on("interactionCreate", async (interaction) => {
           return;
         } catch (err) {
           console.error("Exile error:", err);
-          // log to bot log channel and ping user
-          try {
-            const logChannel = await getLogChannel();
-            if (logChannel) await logChannel.send({ content: `<@${interaction.user.id}> ❌ Exile error: \`\`\`${String(err).slice(0,1900)}\`\`\`` });
-          } catch(_) {}
           return interaction.editReply("❌ Failed to exile user.");
         }
       }
@@ -881,10 +864,6 @@ client.on("interactionCreate", async (interaction) => {
           return;
         } catch (err) {
           console.error("Accept join error:", err);
-          try {
-            const logChannel = await getLogChannel();
-            if (logChannel) await logChannel.send({ content: `<@${interaction.user.id}> ❌ Accept join error: \`\`\`${String(err).slice(0,1900)}\`\`\`` });
-          } catch(_) {}
           return interaction.editReply("❌ Failed to accept join request.");
         }
       }
@@ -894,20 +873,13 @@ client.on("interactionCreate", async (interaction) => {
     // attempt to notify the user (best-effort)
     try {
       if (interaction && !interaction.replied && !interaction.deferred) {
-        await sendEphemeral(interaction, { content: "❌ An internal error occurred." });
+        await interaction.reply({ content: "❌ An internal error occurred.", ephemeral: true });
       } else if (interaction && (interaction.replied || interaction.deferred)) {
-        try { await interaction.editReply({ content: "❌ An internal error occurred.", components: [] }); } catch(_) {}
+        await interaction.editReply({ content: "❌ An internal error occurred.", components: [] });
       }
     } catch (e) {
       // ignore
     }
-    // log to channel and ping user
-    try {
-      const logChannel = await getLogChannel();
-      if (logChannel && interaction?.user?.id) {
-        await logChannel.send({ content: `<@${interaction.user.id}> ❌ An internal error occurred: \`\`\`${String(err).slice(0,1900)}\`\`\`` });
-      }
-    } catch (_) {}
   }
 });
 
@@ -948,10 +920,6 @@ async function initSheets() {
     await client.login(process.env.DISCORD_TOKEN);
   } catch (err) {
     console.error('❌ Startup error:', err);
-    try {
-      const logChannel = await getLogChannel();
-      if (logChannel) await logChannel.send({ content: `❌ Startup error: \`\`\`${String(err).slice(0,1900)}\`\`\`` });
-    } catch(_) {}
   }
 })();
 
@@ -961,19 +929,7 @@ client.on('error', (err) => {
 });
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled Rejection:', reason);
-  (async () => {
-    try {
-      const logChannel = await getLogChannel();
-      if (logChannel) await logChannel.send({ content: `❌ Unhandled Rejection: \`\`\`${String(reason).slice(0,1900)}\`\`\`` });
-    } catch(_) {}
-  })();
 });
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
-  (async () => {
-    try {
-      const logChannel = await getLogChannel();
-      if (logChannel) await logChannel.send({ content: `❌ Uncaught Exception: \`\`\`${String(err).slice(0,1900)}\`\`\`` });
-    } catch(_) {}
-  })();
 });
