@@ -1,4 +1,4 @@
-// Full working bot.js — restored handlers, stronger defers, dedupe + duplicate-removal, modal inputs, cleanup & log
+// Full working bot.js — avoids deferring selects before showModal, and deletes fallback duplicates on success
 
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -61,14 +61,9 @@ async function safeGetCell(sheet, row, col) {
 }
 
 // ---------- Dedup / recent signature store ----------
-// Keeps recently-sent payload signatures per channel to avoid repost races.
-// signature -> { channelId, messageId (optional), expiresAt, payloadSummary }
 const _recentSignatures = new Map();
-// TTL for signature cache (ms)
-const SIGNATURE_TTL_MS = 8000; // slightly larger window
+const SIGNATURE_TTL_MS = 8000;
 
-// Build a concise signature string from a payload object.
-// Includes content, embed title/description, and a summary of components (customId/placeholder/option labels).
 function signatureFromPayload(payload) {
   if (!payload) return '';
   let p = payload;
@@ -77,7 +72,6 @@ function signatureFromPayload(payload) {
   const parts = [];
 
   if (p.content) {
-    // normalize whitespace and trim length
     const c = String(p.content).replace(/\s+/g, ' ').trim();
     if (c) parts.push(c.slice(0, 400));
   }
@@ -88,7 +82,6 @@ function signatureFromPayload(payload) {
     if (e.description) parts.push(String(e.description).replace(/\s+/g, ' ').trim().slice(0, 200));
   }
 
-  // components: ActionRow arrays — inspect them for customId / placeholder / options labels
   if (Array.isArray(p.components) && p.components.length) {
     try {
       const compParts = [];
@@ -111,7 +104,6 @@ function signatureFromPayload(payload) {
     } catch (e) {}
   }
 
-  // final signature
   return parts.join('||').slice(0, 1000);
 }
 
@@ -123,7 +115,7 @@ async function findRegisteredMessageForSignature(sig, channelId) {
     _recentSignatures.delete(sig);
     return null;
   }
-  // If we have stored messageId, try to fetch
+
   if (rec.messageId) {
     try {
       const ch = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
@@ -133,7 +125,7 @@ async function findRegisteredMessageForSignature(sig, channelId) {
     } catch {}
     return null;
   }
-  // no messageId but signature exists (sentinel-only) — attempt to find a recent message matching summary
+
   try {
     const ch = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
     if (!ch || !ch.messages) return null;
@@ -169,26 +161,43 @@ async function deleteRegisteredMessageBySig(sig, channelId, exceptMessageId = nu
   if (!rec) return;
   if (rec.channelId !== channelId) return;
   if (!rec.messageId) return;
-  if (rec.messageId === exceptMessageId) {
-    // same message, nothing to do
-    return;
-  }
+  if (rec.messageId === exceptMessageId) return;
   try {
     const ch = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
     if (!ch || !ch.messages) return;
     await ch.messages.delete(rec.messageId).catch(()=>{});
   } catch (e) {}
-  // remove entry afterward
   _recentSignatures.delete(sig);
+}
+
+// Last-resort: scan recent messages and delete other bot messages that appear similar
+async function deleteOtherBotMessagesSimilar(channelId, keepMessageId, payloadSummary) {
+  if (!channelId) return;
+  try {
+    const ch = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
+    if (!ch || !ch.messages) return;
+    const recent = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+    if (!recent) return;
+    const candidates = recent.filter(m => m.author?.id === client.user?.id && m.id !== keepMessageId);
+    for (const m of candidates.values()) {
+      if (payloadSummary) {
+        const content = (m.content || '');
+        const e = m.embeds?.[0];
+        if (content.includes(payloadSummary) ||
+            (e && ((e.title && e.title.includes(payloadSummary)) || (e.description && e.description.includes(payloadSummary))))) {
+          await m.delete().catch(()=>{});
+        }
+      } else {
+        // if no summary provided, be conservative and only delete exact duplicates
+        await m.delete().catch(()=>{});
+      }
+    }
+  } catch (e) {}
 }
 
 // ---------- Robust interaction/channel sending helpers ----------
 
-// WeakMap to avoid sending the same logical response twice for an interaction
 const _sentOnce = new WeakMap();
-
-// Per-user dedupe map to prevent duplicates across different Interaction objects.
-// key: `${userId}:${key}` -> expiry timestamp (ms)
 const _perUserDedupe = new Map();
 const PER_USER_TTL_MS = 8000;
 
@@ -230,8 +239,6 @@ async function sendOnce(interaction, key, contentObj) {
   return sent;
 }
 
-// Tries interaction.reply/editReply -> followUp -> channel.send.
-// Prevents duplicates by checking signatures and deletes older channel.send when later interaction reply succeeds.
 async function safeSendAndReturnMessage(interaction, contentObj = {}) {
   let payload = contentObj;
   if (typeof contentObj === 'string') payload = { content: contentObj };
@@ -239,7 +246,6 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
   const sig = signatureFromPayload(payload);
   const channelId = interaction?.channel?.id || interaction?.message?.channel?.id || null;
 
-  // If a message with same signature was posted recently, try to return it and ACK interaction.
   if (sig && channelId) {
     const existing = await findRegisteredMessageForSignature(sig, channelId);
     if (existing) {
@@ -265,7 +271,6 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
     timestamp: Date.now(),
   });
 
-  // Try reply/editReply first
   try {
     if (interaction && !interaction.replied && !interaction.deferred) {
       try {
@@ -275,8 +280,8 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
           console.log('safeSend: used reply -> fetched message');
           if (sig && channelId) {
             registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
-            // If there was a previous channel.send with same signature, delete it
             try { await deleteRegisteredMessageBySig(sig, channelId, msg.id); } catch (e) {}
+            try { await deleteOtherBotMessagesSimilar(channelId, msg.id, payload?.content?.slice(0,200) ?? null); } catch(e){}
           }
           return msg;
         } catch (e) {
@@ -298,6 +303,7 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
           if (sig && channelId) {
             registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
             try { await deleteRegisteredMessageBySig(sig, channelId, msg.id); } catch (e) {}
+            try { await deleteOtherBotMessagesSimilar(channelId, msg.id, payload?.content?.slice(0,200) ?? null); } catch(e){}
           }
           return msg;
         } catch (e) {
@@ -313,7 +319,6 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
     console.log('safeSend: reply/edit attempt threw, falling back:', err?.message);
   }
 
-  // Try followUp
   try {
     if (interaction && typeof interaction.followUp === 'function') {
       try {
@@ -323,6 +328,7 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
           if (follow && follow.id) {
             registerSignature(sig, channelId, follow.id, payload?.content?.slice(0,200) ?? null);
             try { await deleteRegisteredMessageBySig(sig, channelId, follow.id); } catch (e) {}
+            try { await deleteOtherBotMessagesSimilar(channelId, follow.id, payload?.content?.slice(0,200) ?? null); } catch(e){}
           } else {
             registerSignature(sig, channelId, null, payload?.content?.slice(0,200) ?? null);
           }
@@ -336,7 +342,6 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
     console.log('safeSend: followUp threw:', err?.message);
   }
 
-  // Channel fallback: pre-register signature (pending) then send; update with messageId after success
   try {
     const channel = interaction?.channel || interaction?.message?.channel;
     if (channel && typeof channel.send === 'function') {
@@ -367,13 +372,11 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
   return null;
 }
 
-// safeReply kept for compatibility
 async function safeReply(interaction, contentObj = {}) {
   await safeSendAndReturnMessage(interaction, contentObj);
   return;
 }
 
-// safeUpdate for component update (tries update, falls back)
 async function safeUpdate(interaction, updateObj = {}) {
   try {
     if (interaction && typeof interaction.update === 'function') {
@@ -391,7 +394,6 @@ async function safeUpdate(interaction, updateObj = {}) {
   }
 }
 
-// ---------- Sheet helper that replies and returns null if sheet missing ----------
 async function getSheetOrReply(doc, title, interaction) {
   if (!doc) {
     try { await safeReply(interaction, { content: '❌ Google Sheets not initialized yet', ephemeral: true }); } catch (e) {}
@@ -405,7 +407,6 @@ async function getSheetOrReply(doc, title, interaction) {
   return sheet;
 }
 
-// ---------- Message deletion helpers ----------
 async function safeDeleteMessage(msgOrId, channelContext = null) {
   if (!msgOrId) return;
   try {
@@ -477,7 +478,6 @@ async function safeDeleteMessage(msgOrId, channelContext = null) {
   } catch (e) {}
 }
 
-// get log channel (env BOT_LOG_CHANNEL_ID or cfg.logChannelId)
 async function getLogChannel() {
   const id = process.env.BOT_LOG_CHANNEL_ID || (cfg && cfg.logChannelId);
   if (!id) return null;
@@ -488,15 +488,6 @@ async function getLogChannel() {
   }
 }
 
-/*
-  cleanupAndLog options:
-    - interaction: the Interaction object (required)
-    - userMessages: array of user Message objects or ids to delete
-    - botMessages: array of bot Message objects or ids to delete
-    - menuMessage: the original menu message (interaction.message or menuMessage)
-    - componentMessages: array of component messages (like select.message)
-    - logText: string to send to log channel (will ping acting user)
-*/
 async function cleanupAndLog({
   interaction,
   userMessages = [],
@@ -572,10 +563,10 @@ const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   }
 })();
 
-// --- SINGLE interactionCreate handler (restored flows + early defers) ---
+// --- SINGLE interactionCreate handler (adjusted: do NOT pre-defer selects/buttons) ---
 client.on("interactionCreate", async (interaction) => {
   try {
-    // --- EARLY DEFERRAL: prevents token expiry races that cause 10062 Unknown interaction ---
+    // --- Only defer chat commands early to avoid token expiry ---
     if (interaction.isChatInputCommand()) {
       try {
         if (!interaction.replied && !interaction.deferred) {
@@ -587,20 +578,8 @@ client.on("interactionCreate", async (interaction) => {
         console.log('deferReply outer catch:', e?.message);
       }
     }
-    if (interaction.isStringSelectMenu() || interaction.isButton() || interaction.isModalSubmit()) {
-      try {
-        if (!interaction.replied && !interaction.deferred && interaction.type !== 5 /* MODAL SUBMIT is not deferred the same way */) {
-          if (interaction.isStringSelectMenu() || interaction.isButton()) {
-            await interaction.deferUpdate().catch((e) => {
-              console.log('early deferUpdate failed (safe to ignore):', e?.message);
-            });
-          }
-        }
-      } catch (e) {
-        console.log('deferUpdate outer catch:', e?.message);
-      }
-    }
-    // --- end early deferral ---
+    // NOTE: Do NOT defer StringSelectMenu/Button here — we need to allow showModal calls.
+    // --- end defer logic ---
 
     // Chat input commands
     if (interaction.isChatInputCommand()) {
@@ -705,9 +684,8 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
-    // Handle string select menus for rc_action_... and tracker_action_...
+    // Handle select menus — DO NOT pre-defer here, so showModal works
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("tracker_action_") || interaction.customId.startsWith("rc_action_"))) {
-      // ensure only the original user interacts
       const parts = interaction.customId.split('_');
       const tailUserId = parts[parts.length - 1];
       if (tailUserId !== interaction.user.id) {
@@ -829,14 +807,15 @@ client.on("interactionCreate", async (interaction) => {
 
     // Handle modal submissions
     if (interaction.isModalSubmit()) {
-      // Ensure modal was intended for this user
       const modalId = interaction.customId;
       if (modalId.includes(`_${interaction.user.id}`) === false) {
         await safeReply(interaction, { content: "❌ This modal isn't for you.", ephemeral: true });
         return;
       }
 
-      // RC - change rank
+      // The modal handlers below all use safeReply (ephemeral) for the processing status.
+      // After processing they call cleanupAndLog which attempts to delete menus and log the result.
+
       if (modalId.startsWith('rc_modal_changeRank_')) {
         const username = interaction.fields.getTextInputValue('username').trim();
         const rankInput = interaction.fields.getTextInputValue('rank').trim();
@@ -846,7 +825,6 @@ client.on("interactionCreate", async (interaction) => {
         try {
           if (!cfg.groupId) throw new Error('cfg.groupId is missing');
           const userId = await noblox.getIdFromUsername(username);
-          // Try interpret rank as number first, else try to find role by name
           let rankNumber = parseInt(rankInput, 10);
           if (isNaN(rankNumber)) {
             const roles = await noblox.getRoles(cfg.groupId);
@@ -863,24 +841,14 @@ client.on("interactionCreate", async (interaction) => {
           await safeReply(interaction, { content: `❌ Failed to change rank: ${err.message || err}`, ephemeral: true });
         }
 
-        // Attempt to delete any menu message (the select) and log
         try {
-          // find the menu message in the channel by signature
           const sig = signatureFromPayload({ content: "Choose an action:" });
           const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
-          await cleanupAndLog({
-            interaction,
-            userMessages: [],
-            botMessages: [],
-            menuMessage: menuMsg,
-            componentMessages: [],
-            logText
-          });
+          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
         } catch (e) {}
         return;
       }
 
-      // RC - kick
       if (modalId.startsWith('rc_modal_kick_')) {
         const username = interaction.fields.getTextInputValue('username').trim();
         const reason = interaction.fields.getTextInputValue('reason')?.trim() || 'No reason provided';
@@ -907,7 +875,6 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      // RC - accept join
       if (modalId.startsWith('rc_modal_accept_')) {
         const username = interaction.fields.getTextInputValue('username').trim();
         await safeReply(interaction, { content: `Processing accept join for ${username}...`, ephemeral: true });
@@ -916,13 +883,11 @@ client.on("interactionCreate", async (interaction) => {
         try {
           if (!cfg.groupId) throw new Error('cfg.groupId is missing');
           const userId = await noblox.getIdFromUsername(username);
-          // Attempt to accept join requests (noblox method may vary)
           if (typeof noblox.handleJoinRequest === 'function') {
             await noblox.handleJoinRequest(cfg.groupId, userId, true);
             logText = `Completed: Accepted join request for ${username}`;
             await safeReply(interaction, { content: `✅ Accepted join for ${username}`, ephemeral: true });
           } else {
-            // fallback: set rank to default 1
             await noblox.setRank(cfg.groupId, userId, 1);
             logText = `Completed (fallback): Set rank 1 for ${username}`;
             await safeReply(interaction, { content: `✅ Accepted (fallback) for ${username}`, ephemeral: true });
@@ -941,7 +906,6 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      // Tracker modals
       if (modalId.startsWith('tracker_modal_add_')) {
         const username = interaction.fields.getTextInputValue('username').trim();
         const placement = interaction.fields.getTextInputValue('placement').trim();
