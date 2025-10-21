@@ -1,4 +1,4 @@
-// bot.txt
+// bot.js
 
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -19,7 +19,8 @@ const noblox = require("noblox.js");
 const fetch = require("node-fetch");
 const express = require('express');
 
-let sheetDoc; // will hold the GoogleSpreadsheet instance
+// Will hold the GoogleSpreadsheet instance after init
+let sheetDoc = null;
 
 console.log("Env present:", {
   GOOGLE_CLIENT_EMAIL: !!process.env.GOOGLE_CLIENT_EMAIL,
@@ -54,20 +55,33 @@ async function safeGetCell(sheet, row, col) {
   return sheet.getCell(row, col);
 }
 
-// Sheet lookup helper (existence guard)
-function getSheetOrReply(doc, title, interaction) {
+// Sheet lookup helper (existence guard).
+// Returns the sheet or null after replying to the interaction.
+async function getSheetOrReply(doc, title, interaction) {
   if (!doc) {
-    if (!interaction.deferred && !interaction.replied) {
-      return interaction.reply('❌ Google Sheets not initialized yet');
+    try {
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.reply({ content: '❌ Google Sheets not initialized yet', ephemeral: true });
+      } else {
+        await interaction.followUp({ content: '❌ Google Sheets not initialized yet', ephemeral: true });
+      }
+    } catch (e) {
+      // ignore
     }
-    return interaction.followUp('❌ Google Sheets not initialized yet');
+    return null;
   }
   const sheet = doc.sheetsByTitle[title];
   if (!sheet) {
-    if (!interaction.deferred && !interaction.replied) {
-      return interaction.reply(`❌ Sheet "${title}" not found`);
+    try {
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.reply({ content: `❌ Sheet "${title}" not found`, ephemeral: true });
+      } else {
+        await interaction.followUp({ content: `❌ Sheet "${title}" not found`, ephemeral: true });
+      }
+    } catch (e) {
+      // ignore
     }
-    return interaction.followUp(`❌ Sheet "${title}" not found`);
+    return null;
   }
   return sheet;
 }
@@ -75,8 +89,12 @@ function getSheetOrReply(doc, title, interaction) {
 // Roblox cookie init
 (async () => {
   try {
-    await noblox.setCookie(process.env.ROBLOX_COOKIE);
-    console.log("✅ Roblox cookie set");
+    if (process.env.ROBLOX_COOKIE) {
+      await noblox.setCookie(process.env.ROBLOX_COOKIE);
+      console.log("✅ Roblox cookie set");
+    } else {
+      console.warn("ROBLOX_COOKIE not set; roblox features will fail until provided.");
+    }
   } catch (err) {
     console.error("❌ Roblox cookie error:", err);
   }
@@ -111,12 +129,92 @@ const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   }
 })();
 
-// Helper for safe replies
+// Helper for safe replies (reply vs editReply)
 async function confirm(interaction, msg) {
   if (interaction.replied || interaction.deferred) {
-    return interaction.editReply({ content: msg, components: [] });
+    try {
+      return await interaction.editReply({ content: msg, components: [] });
+    } catch (e) {
+      // fallback to followUp if editReply fails
+      try { return await interaction.followUp({ content: msg }); } catch (e2) { return null; }
+    }
   }
   return interaction.reply({ content: msg, components: [] });
+}
+
+// best-effort delete helper
+async function safeDeleteMessage(msg) {
+  if (!msg) return;
+  try {
+    // If it's a Message object
+    if (typeof msg.delete === 'function') {
+      await msg.delete().catch(() => {});
+      return;
+    }
+    // fallback: if we have id and channel
+    if (msg.id && msg.channel) {
+      await msg.channel.messages.delete(msg.id).catch(() => {});
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+// get log channel (env BOT_LOG_CHANNEL_ID or cfg.logChannelId)
+async function getLogChannel() {
+  const id = process.env.BOT_LOG_CHANNEL_ID || (cfg && cfg.logChannelId);
+  if (!id) return null;
+  try {
+    return client.channels.cache.get(id) || await client.channels.fetch(id);
+  } catch (e) {
+    return null;
+  }
+}
+
+/*
+  cleanupAndLog options:
+    - interaction: the Interaction object (required)
+    - userMessages: array of user Message objects to delete
+    - botMessages: array of bot Message objects to delete
+    - menuMessage: the original menu message (interaction.message or menuMessage)
+    - componentMessages: array of component messages (like select.message)
+    - logText: string to send to log channel (can include mention <@userid>)
+*/
+async function cleanupAndLog({
+  interaction,
+  userMessages = [],
+  botMessages = [],
+  menuMessage = null,
+  componentMessages = [],
+  logText = ''
+}) {
+  // flatten and unique
+  const all = [
+    ...userMessages.filter(Boolean),
+    ...botMessages.filter(Boolean),
+    ...(menuMessage ? [menuMessage] : []),
+    ...componentMessages.filter(Boolean),
+  ];
+
+  // Parallel best-effort deletes
+  await Promise.all(all.map(m => safeDeleteMessage(m)));
+
+  // Send a log message (ping the acting user)
+  const logChannel = await getLogChannel();
+  if (!logChannel) {
+    console.warn('BOT_LOG_CHANNEL_ID not set or channel not found; skipping log send.');
+    return;
+  }
+
+  try {
+    // keep it simple: ping the user who ran it and include details
+    const content = (logText && typeof logText === 'string')
+      ? `<@${interaction.user.id}> — ${logText}`
+      : `<@${interaction.user.id}> performed an action.`;
+    await logChannel.send({ content });
+  } catch (err) {
+    console.error('Failed to send log message:', err);
+  }
 }
 
 // --- SINGLE interactionCreate handler ---
@@ -210,7 +308,6 @@ client.on("interactionCreate", async (interaction) => {
           // --- Fetch all badges via /badges endpoint ---
           let allBadges = [];
           let cursor = "";
-          let pageCount = 0;
           do {
             const res = await fetch(
               `https://badges.roblox.com/v1/users/${userId}/badges?limit=100&sortOrder=Asc${cursor ? `&cursor=${cursor}` : ""}`
@@ -219,7 +316,6 @@ client.on("interactionCreate", async (interaction) => {
             if (!page.data) break;
             allBadges.push(...page.data);
             cursor = page.nextPageCursor;
-            pageCount++;
           } while (cursor);
 
           const totalBadges = allBadges.length;
@@ -276,6 +372,8 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       const action = interaction.values[0];
+
+      // Update the menu message to ask for username
       await interaction.update({
         content: `Enter the username for **${action.replace("_", " ")}**:`,
         components: []
@@ -308,32 +406,52 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         const [startDate, endDate] = dateMsg.first().content.trim().split(" ");
-        const recruits = getSheetOrReply(sheetDoc, "RECRUITS", interaction);
+        const recruits = await getSheetOrReply(sheetDoc, "RECRUITS", interaction);
         if (!recruits) return;
 
         await recruits.loadCells("E12:N32");
 
+        let inserted = false;
         for (let row = 11; row <= 31; row++) {
-          const cell = recruits.getCell(row, 4); // Column E
+          const cell = recruits.getCell(row, 4); // Column E (0-index)
           if (!cell.value) {
             cell.value = username;
-            recruits.getCell(row, 12).value = startDate; // Column M
-            recruits.getCell(row, 13).value = endDate;   // Column N
+            recruits.getCell(row, 12).value = startDate; // Column M (0-index)
+            recruits.getCell(row, 13).value = endDate;   // Column N (0-index)
             await recruits.saveUpdatedCells();
-            return interaction.editReply({
-              content: `✅ Added **${username}** to RECRUITS with dates.`
+
+            await interaction.editReply({
+              content: `✅ Added **${username}** to RECRUITS with dates.`,
+              components: []
             });
+
+            const botReply = await interaction.fetchReply().catch(() => null);
+            const userMsg = collected?.first ? collected.first() : null; // username message
+            const dateMsgObj = dateMsg?.first ? dateMsg.first() : null; // dates message
+            await cleanupAndLog({
+              interaction,
+              userMessages: [userMsg, dateMsgObj],
+              botMessages: [botReply],
+              menuMessage: interaction.message,
+              logText: `Added to RECRUITS: **${username}** — ${startDate} → ${endDate}`
+            });
+
+            inserted = true;
+            break;
           }
         }
-        return interaction.editReply({
-          content: "❌ No empty slot found in RECRUITS."
-        });
+        if (!inserted) {
+          return interaction.editReply({
+            content: "❌ No empty slot found in RECRUITS."
+          });
+        }
+        return;
       }
 
       // ---------------- PROMOTE PLACEMENT ----------------
       if (action === "promote_placement") {
-        const recruits = getSheetOrReply(sheetDoc, "RECRUITS", interaction);
-        const commandos = getSheetOrReply(sheetDoc, "COMMANDOS", interaction);
+        const recruits = await getSheetOrReply(sheetDoc, "RECRUITS", interaction);
+        const commandos = await getSheetOrReply(sheetDoc, "COMMANDOS", interaction);
         if (!recruits || !commandos) return;
 
         await recruits.loadCells("E12:N32");
@@ -351,12 +469,14 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.editReply({ content: "❌ User not found in RECRUITS." });
         }
 
+        let promoted = false;
         for (let row = 15; row <= 27; row++) {
           const cell = commandos.getCell(row, 4);
           if (!cell.value || cell.value === "-") {
             cell.value = username;
             await commandos.saveUpdatedCells();
 
+            // Clear recruit row fields
             recruits.getCell(foundRow, 4).value = "";
             for (let col = 5; col <= 8; col++) {
               recruits.getCell(foundRow, col).value = false;
@@ -366,10 +486,25 @@ client.on("interactionCreate", async (interaction) => {
 
             await recruits.saveUpdatedCells();
 
-            return interaction.editReply({ content: `✅ Promoted **${username}** to COMMANDOS.` });
+            await interaction.editReply({ content: `✅ Promoted **${username}** to COMMANDOS.`, components: [] });
+            const botReply = await interaction.fetchReply().catch(() => null);
+            const userMsg = collected?.first ? collected.first() : null; // if you collected username earlier
+            await cleanupAndLog({
+              interaction,
+              userMessages: [userMsg],
+              botMessages: [botReply],
+              menuMessage: interaction.message,
+              logText: `Promoted **${username}** to COMMANDOS`
+            });
+
+            promoted = true;
+            break;
           }
         }
-        return interaction.editReply({ content: "❌ No empty slot in COMMANDOS." });
+        if (!promoted) {
+          return interaction.editReply({ content: "❌ No empty slot in COMMANDOS." });
+        }
+        return;
       }
 
       // ---------------- REMOVE USER ----------------
@@ -383,8 +518,10 @@ client.on("interactionCreate", async (interaction) => {
           { name: "CLONE FORCE 99", rows: [11, 11], altRows: [13, 16] }
         ];
 
+        let foundAnywhere = false;
+
         for (const sheetInfo of sheets) {
-          const sheet = getSheetOrReply(sheetDoc, sheetInfo.name, interaction);
+          const sheet = await getSheetOrReply(sheetDoc, sheetInfo.name, interaction);
           if (!sheet) continue;
 
           await sheet.loadCells("A1:Z50");
@@ -403,21 +540,36 @@ client.on("interactionCreate", async (interaction) => {
           for (const row of [...checkRows, ...altRows]) {
             const cell = sheet.getCell(row, 4); // column E
             if (cell.value === username) {
+              foundAnywhere = true;
+              // Handle RECRUITS special case
               if (sheetInfo.name === "RECRUITS") {
-                // Clear E, M, N
+                // Clear E, M, N and uncheck F,G,H,I
                 cell.value = "";
                 sheet.getCell(row, 12).value = ""; // column M
                 sheet.getCell(row, 13).value = ""; // column N
-                // Uncheck F,G,H,I (columns 5,6,7,8)
                 for (let col = 5; col <= 8; col++) {
                   sheet.getCell(row, col).value = false;
                 }
                 await sheet.saveUpdatedCells();
-                return interaction.editReply({
-                  content: `✅ Removed **${username}** from RECRUITS.`
+
+                await interaction.editReply({
+                  content: `✅ Removed **${username}** from RECRUITS.`,
+                  components: []
                 });
-              } else if (checkRows.includes(row)) {
-                // rows: E cleared, F=0, H formula x=0, I="N/A", J/K="N/A", L="", M="E"
+                const botReply = await interaction.fetchReply().catch(() => null);
+                const userMsg = collected?.first ? collected.first() : null;
+                await cleanupAndLog({
+                  interaction,
+                  userMessages: [userMsg],
+                  botMessages: [botReply],
+                  menuMessage: interaction.message,
+                  logText: `Removed **${username}** from RECRUITS.`
+                });
+                return;
+              }
+
+              // For primary rows region (checkRows)
+              if (checkRows.includes(row)) {
                 cell.value = "";
                 sheet.getCell(row, 5).value = 0; // F
                 const formulaCell = sheet.getCell(row, 7); // H
@@ -430,19 +582,39 @@ client.on("interactionCreate", async (interaction) => {
                 sheet.getCell(row, 11).value = ""; // L
                 sheet.getCell(row, 12).value = "E"; // M
                 await sheet.saveUpdatedCells();
-                return interaction.editReply({
-                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`
+
+                await interaction.editReply({
+                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`,
+                  components: []
                 });
-              } else if (altRows.includes(row)) {
-                // altRows: E cleared, F=0, G logic stays (except CLONE FORCE 99), H formula x=0, I="N/A", J/K="N/A", L="", M="E"
+                const botReply = await interaction.fetchReply().catch(() => null);
+                const userMsg = collected?.first ? collected.first() : null;
+                await cleanupAndLog({
+                  interaction,
+                  userMessages: [userMsg],
+                  botMessages: [botReply],
+                  menuMessage: interaction.message,
+                  logText: `Removed **${username}** from ${sheetInfo.name}.`
+                });
+                return;
+              }
+
+              // For altRows region
+              if (altRows.includes(row)) {
                 cell.value = "";
                 sheet.getCell(row, 5).value = 0; // F
 
                 // Only update G column if NOT CLONE FORCE 99
                 if (sheetInfo.name !== "CLONE FORCE 99") {
-                  const gCell = sheet.getCell(row, 6);
+                  const gCell = sheet.getCell(row, 6); // G
+                  // Set numeric zero to represent 12:00:00 AM and set numberFormat to TIME
                   gCell.value = 0;
-                  gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
+                  try {
+                    gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
+                  } catch (e) {
+                    // some versions of google-spreadsheet expect userEnteredFormat,
+                    // but the typical { type, pattern } works; ignore if API rejects here.
+                  }
                 }
 
                 const formulaCell = sheet.getCell(row, 7); // H
@@ -455,20 +627,35 @@ client.on("interactionCreate", async (interaction) => {
                 sheet.getCell(row, 11).value = ""; // L
                 sheet.getCell(row, 12).value = "E"; // M
                 await sheet.saveUpdatedCells();
-                return interaction.editReply({
-                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`
+
+                await interaction.editReply({
+                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`,
+                  components: []
                 });
+                const botReply = await interaction.fetchReply().catch(() => null);
+                const userMsg = collected?.first ? collected.first() : null;
+                await cleanupAndLog({
+                  interaction,
+                  userMessages: [userMsg],
+                  botMessages: [botReply],
+                  menuMessage: interaction.message,
+                  logText: `Removed **${username}** from ${sheetInfo.name}.`
+                });
+                return;
               }
             }
           }
         }
 
-        return interaction.editReply({ content: "❌ User not found in any sheet." });
+        if (!foundAnywhere) {
+          return interaction.editReply({ content: "❌ User not found in any sheet." });
+        }
       }
 
       // --- Default ---
       await interaction.editReply({
-        content: `⚠️ Action **${action}** not yet implemented.`
+        content: `⚠️ Action **${action}** not yet implemented.`,
+        components: []
       });
     }
 
@@ -542,12 +729,31 @@ client.on("interactionCreate", async (interaction) => {
           const currentRank = await noblox.getRankInGroup(groupId, userId);
           await noblox.setRank(groupId, userId, rank);
 
+          // show a brief confirmation so the user sees it
           await interaction.editReply({
-            content: `✅ Rank changed for **${uname}** (ID: ${userId}) — ${currentRank} ➝ ${rank}.`,
-            components: [],
+           content: `✅ Rank changed for **${uname}** (ID: ${userId}) — ${currentRank} ➝ ${rank}.`,
+           components: [],
           });
 
-          await menuMessage.delete().catch(() => {});
+          // fetch the bot reply message (so we can delete it)
+          const botReply = await interaction.fetchReply().catch(() => null);
+
+          // the username message the user sent earlier (variable in this scope is msgCollected)
+          const userMsg = (typeof msgCollected?.first === 'function') ? msgCollected.first() : null;
+
+          // the select component message (where the role was chosen)
+          const componentMsg = select?.message ?? null;
+
+          // original menu message (declared earlier as menuMessage)
+          await cleanupAndLog({
+           interaction,
+           userMessages: [userMsg],
+           botMessages: [botReply],
+           menuMessage,
+           componentMessages: [componentMsg],
+           logText: `Rank changed for **${uname}** (ID: ${userId}) — ${currentRank} ➝ ${rank}.`
+          });
+
           return;
         } catch (err) {
           console.error("Rank change error:", err);
@@ -563,19 +769,37 @@ client.on("interactionCreate", async (interaction) => {
           max: 1,
           time: 30000,
         });
+
         if (!msgCollected.size) {
           return interaction.editReply("⏳ Timed out waiting for username.");
         }
-        const username = msgCollected.first().content.trim();
 
+        const username = msgCollected.first().content.trim();
         await interaction.editReply(`🪓 Exiling **${username}**…`);
 
         try {
           const userId = await noblox.getIdFromUsername(username);
           await noblox.exile(groupId, userId);
 
+          // show a brief confirmation so the user sees it
           await interaction.editReply(`✅ Exiled **${username}** (ID: ${userId}).`);
-          await menuMessage.delete().catch(() => {});
+
+          // fetch the bot reply message (so we can delete it)
+          const botReply = await interaction.fetchReply().catch(() => null);
+
+          // the username message the user sent earlier
+          const userMsg = msgCollected.first();
+
+          // cleanup and log
+          await cleanupAndLog({
+            interaction,
+            userMessages: [userMsg],
+            botMessages: [botReply],
+            menuMessage,
+            componentMessages: [],
+            logText: `Exiled **${username}** (ID: ${userId}).`
+          });
+
           return;
         } catch (err) {
           console.error("Exile error:", err);
@@ -591,11 +815,12 @@ client.on("interactionCreate", async (interaction) => {
           max: 1,
           time: 30000,
         });
+
         if (!msgCollected.size) {
           return interaction.editReply("⏳ Timed out waiting for username.");
         }
-        const username = msgCollected.first().content.trim();
 
+        const username = msgCollected.first().content.trim();
         await interaction.editReply(`✅ Accepting join request for **${username}**…`);
 
         try {
@@ -603,7 +828,19 @@ client.on("interactionCreate", async (interaction) => {
           await noblox.handleJoinRequest(groupId, userId, true);
 
           await interaction.editReply(`✅ Accepted join request for **${username}** (ID: ${userId}).`);
-          await menuMessage.delete().catch(() => {});
+
+          const botReply = await interaction.fetchReply().catch(() => null);
+          const userMsg = msgCollected.first();
+
+          await cleanupAndLog({
+            interaction,
+            userMessages: [userMsg],
+            botMessages: [botReply],
+            menuMessage,
+            componentMessages: [],
+            logText: `Accepted join request for **${username}** (ID: ${userId}).`
+          });
+
           return;
         } catch (err) {
           console.error("Accept join error:", err);
@@ -612,9 +849,16 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
   } catch (err) {
-    console.error("Error in interactionCreate handler:", err);
-    if (interaction.isRepliable() && !interaction.replied) {
-      await interaction.reply({ content: "❌ Something went wrong.", ephemeral: true });
+    console.error("Unhandled interaction error:", err);
+    // attempt to notify the user (best-effort)
+    try {
+      if (interaction && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: "❌ An internal error occurred.", ephemeral: true });
+      } else if (interaction && (interaction.replied || interaction.deferred)) {
+        await interaction.editReply({ content: "❌ An internal error occurred.", components: [] });
+      }
+    } catch (e) {
+      // ignore
     }
   }
 });
@@ -622,7 +866,17 @@ client.on("interactionCreate", async (interaction) => {
 // --- Google Sheets init (single, authoritative) ---
 const { GoogleAuth } = require('google-auth-library');
 async function initSheets() {
-  const privateKey = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
+  if (!process.env.GOOGLE_CLIENT_EMAIL || !process.env.GOOGLE_PRIVATE_KEY || !process.env.SPREADSHEET_ID) {
+    console.warn("Google Sheets credentials or SPREADSHEET_ID missing; skipping initSheets.");
+    return null;
+  }
+  let privateKey = process.env.GOOGLE_PRIVATE_KEY;
+  try {
+    privateKey = privateKey.replace(/\\n/g, '\n');
+  } catch (e) {
+    // leave as-is
+  }
+
   const auth = new GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
@@ -630,6 +884,8 @@ async function initSheets() {
     },
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
+
+  // Construct doc. Newer google-spreadsheet versions accept auth via second param.
   const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, auth);
   await doc.loadInfo();
   console.log('✅ Google Sheets connected:', doc.title);
