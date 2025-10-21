@@ -18,6 +18,39 @@ const noblox = require("noblox.js");
 const fetch = require("node-fetch");
 const express = require('express');
 
+// --- Fetch polyfill and ephemeral flags compatibility ---
+// Ensures `fetch` exists in this CommonJS environment and normalises node-fetch imports.
+let fetch;
+try {
+  // If Node has global fetch (Node 18+), use it
+  if (typeof globalThis.fetch === 'function') {
+    fetch = globalThis.fetch;
+  } else {
+    // require node-fetch and use its default export when present
+    const nf = require('node-fetch');
+    fetch = nf && nf.default ? nf.default : nf;
+  }
+} catch (e) {
+  // Last resort: attempt dynamic import (works in many hosts)
+  fetch = (...args) => import('node-fetch').then(m => m.default(...args));
+}
+
+// Helper to send ephemeral-style interaction replies using flags (no code-wide refactor required).
+// Use `sendEphemeral(interaction, options)` instead of `{ ephemeral: true }` to avoid deprecation warnings.
+const EPHEMERAL_FLAG = 1 << 6;
+async function sendEphemeral(interaction, options) {
+  const payload = { ...options };
+  // if content/components/embeds set, use them; ensure flags are set
+  payload.flags = (payload.flags || 0) | EPHEMERAL_FLAG;
+  // prefer reply if not replied, else followUp
+  try {
+    if (!interaction.replied && !interaction.deferred) return await interaction.reply(payload);
+    return await interaction.followUp(payload);
+  } catch (err) {
+    try { return await interaction.followUp(payload); } catch (e) { return null; }
+  }
+}
+
 // GLOBALS
 let sheetDoc = null;
 const recentInteractions = new Set();
