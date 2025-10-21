@@ -1,4 +1,4 @@
-// Rewritten: conservative acknowledgement, component-safe, duplicate-deletion fallback, restored handlers
+// Full corrected bot.js — guarded defers and robust safeReply/safeUpdate fallbacks.
 
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -12,783 +12,839 @@ const {
   StringSelectMenuBuilder,
   PermissionsBitField,
   EmbedBuilder,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
-  InteractionType,
+  ButtonBuilder,
+  ButtonStyle,
 } = require("discord.js");
 const noblox = require("noblox.js");
 const fetch = require("node-fetch");
 const express = require('express');
 
-const DEBUG = !!process.env.DEBUG_SIGNATURES;
-
-// will hold Google sheet
+// Will hold the GoogleSpreadsheet instance after init
 let sheetDoc = null;
 
 console.log("Env present:", {
   GOOGLE_CLIENT_EMAIL: !!process.env.GOOGLE_CLIENT_EMAIL,
   GOOGLE_PRIVATE_KEY: !!process.env.GOOGLE_PRIVATE_KEY,
   SPREADSHEET_ID: !!process.env.SPREADSHEET_ID,
-  ROBLOX_COOKIE: !!process.env.ROBLOX_COOKIE,
-  BOT_LOG_CHANNEL_ID: !!process.env.BOT_LOG_CHANNEL_ID,
-  DEBUG
 });
 
 // Discord client
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
-// health server
+// --- Health check server for Render / UptimeRobot ---
 const app = express();
 app.get('/', (req, res) => res.status(200).send('OK'));
 app.get('/health', (req, res) => res.status(200).json({ status: 'up' }));
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Health server listening on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Health server listening on :${PORT}`);
+});
 
-// ---------- Utilities ----------
-function isComponentInteraction(interaction) {
-  // select menus and buttons are component interactions; modal submit is InteractionType.ModalSubmit
-  try {
-    return interaction?.isStringSelectMenu?.() || interaction?.isButton?.() || (interaction?.type === InteractionType.ModalSubmit);
-  } catch {
-    return false;
+// Safe cell access helper (bounds guard)
+async function safeGetCell(sheet, row, col) {
+  if (!sheet) throw new Error("❌ Sheet not found");
+  if (row >= sheet.rowCount || col >= sheet.columnCount) {
+    throw new Error(`❌ Cell [${row},${col}] is out of bounds`);
   }
+  return sheet.getCell(row, col);
 }
 
-// ---------- Signature store ----------
-const _recentSignatures = new Map();
-const SIGNATURE_TTL_MS = 8000;
-
-function signatureFromPayload(payload) {
-  if (!payload) return '';
-  let p = payload;
-  if (typeof payload === 'string') p = { content: payload };
-  const parts = [];
-  if (p.content) parts.push(String(p.content).replace(/\s+/g, ' ').trim().slice(0, 400));
-  if (Array.isArray(p.embeds) && p.embeds[0]) {
-    const e = p.embeds[0];
-    if (e.title) parts.push(String(e.title).replace(/\s+/g, ' ').trim().slice(0,200));
-    if (e.description) parts.push(String(e.description).replace(/\s+/g, ' ').trim().slice(0,200));
-  }
-  if (Array.isArray(p.components) && p.components.length) {
+// safeReply & safeUpdate — robust wrappers used everywhere below
+async function safeReply(interaction, contentObj = {}) {
+  try {
+    if (!interaction) return null;
+    if (!interaction.replied && !interaction.deferred) {
+      return await interaction.reply(contentObj);
+    }
+    return await interaction.editReply(contentObj);
+  } catch (err) {
+    // fallback to followUp, then channel.send
     try {
-      const compParts = [];
-      for (const row of p.components) {
-        const comps = row.components ?? row;
-        if (!Array.isArray(comps)) continue;
-        for (const c of comps) {
-          if (!c) continue;
-          if (c.customId) compParts.push(String(c.customId));
-          else if (c.placeholder) compParts.push(String(c.placeholder));
-          else if (Array.isArray(c.options) && c.options.length) {
-            compParts.push(c.options.slice(0,5).map(o => String(o.label||o.value||'').replace(/\s+/g,' ').trim()).join(','));
-          } else if (c.label) compParts.push(String(c.label));
-        }
+      if (interaction && typeof interaction.followUp === 'function') {
+        return await interaction.followUp(contentObj);
       }
-      if (compParts.length) parts.push(compParts.join('|').slice(0,400));
-    } catch {}
-  }
-  const sig = parts.join('||').slice(0,1000);
-  if (DEBUG) console.log('signatureFromPayload ->', sig);
-  return sig;
-}
-
-function registerSignature(sig, channelId, messageId = null, payloadSummary = null) {
-  if (!sig || !channelId) return;
-  _recentSignatures.set(sig, {
-    channelId,
-    messageId: messageId || null,
-    payloadSummary: payloadSummary || null,
-    expiresAt: Date.now() + SIGNATURE_TTL_MS,
-  });
-  if (DEBUG) console.log('registerSignature', sig, '->', _recentSignatures.get(sig));
-}
-
-async function findRegisteredMessageForSignature(sig, channelId) {
-  if (!sig || !channelId) return null;
-  const rec = _recentSignatures.get(sig);
-  if (!rec) return null;
-  if (rec.channelId !== channelId) return null;
-  if (rec.expiresAt <= Date.now()) {
-    _recentSignatures.delete(sig);
-    return null;
-  }
-  if (rec.messageId) {
+    } catch (err2) {
+      // continue to channel fallback
+    }
     try {
-      const ch = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
-      if (!ch?.messages) return null;
-      const m = await ch.messages.fetch(rec.messageId).catch(()=>null);
-      if (m) return m;
-    } catch {}
-    return null;
-  }
-  // sentinel-only: try to find by payloadSummary among recent bot messages
-  try {
-    const ch = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
-    if (!ch?.messages) return null;
-    const recent = await ch.messages.fetch({ limit: 50 }).catch(()=>null);
-    if (!recent) return null;
-    const candidates = recent.filter(m => m.author?.id === client.user?.id);
-    for (const m of candidates.values()) {
-      if (rec.payloadSummary && (m.content || '').includes(rec.payloadSummary)) return m;
-      const e = m.embeds?.[0];
-      if (e && rec.payloadSummary && ((e.title && e.title.includes(rec.payloadSummary)) || (e.description && e.description.includes(rec.payloadSummary)))) {
-        return m;
+      const channel = interaction?.channel || interaction?.message?.channel;
+      if (channel) {
+        const body = (typeof contentObj === 'object' && contentObj.content) ? contentObj.content : contentObj;
+        console.warn('safeReply: falling back to channel.send (interaction token likely expired).');
+        return await channel.send(body);
       }
+    } catch (err3) {
+      // nothing else to do
     }
-    return null;
-  } catch {
     return null;
   }
 }
 
-// delete a previously registered message when we know the new interaction-created message succeeded
-async function deleteRegisteredMessageBySig(sig, channelId, exceptMessageId = null) {
-  if (!sig || !channelId) return;
-  const rec = _recentSignatures.get(sig);
-  if (!rec) return;
-  if (rec.channelId !== channelId) return;
-  if (!rec.messageId) return;
-  if (rec.messageId === exceptMessageId) {
-    _recentSignatures.delete(sig);
-    return;
-  }
-  try {
-    const ch = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
-    if (!ch?.messages) return;
-    await ch.messages.delete(rec.messageId).catch(()=>{});
-  } catch {}
-  _recentSignatures.delete(sig);
-}
-
-// last-resort scan & delete messages that are similar
-async function deleteOtherBotMessagesSimilar(channelId, keepMessageId, payloadSummary) {
-  if (!channelId) return;
-  try {
-    const ch = client.channels.cache.get(channelId) || await client.channels.fetch(channelId);
-    if (!ch?.messages) return;
-    const recent = await ch.messages.fetch({ limit: 50 }).catch(()=>null);
-    if (!recent) return;
-    const candidates = recent.filter(m => m.author?.id === client.user?.id && m.id !== keepMessageId);
-    for (const m of candidates.values()) {
-      if (!payloadSummary) continue;
-      const e = m.embeds?.[0];
-      if ((m.content || '').includes(payloadSummary) ||
-          (e && ((e.title && e.title.includes(payloadSummary)) || (e.description && e.description.includes(payloadSummary))))) {
-        await m.delete().catch(()=>{});
-      }
-    }
-  } catch {}
-}
-
-// ---------- Safe send helpers ----------
-const _sentOnce = new WeakMap();
-const _perUserDedupe = new Map();
-const PER_USER_TTL_MS = 4000;
-
-async function sendOnce(interaction, key, contentObj) {
-  if (!interaction) {
-    const ch = contentObj?.channel || null;
-    if (ch && typeof ch.send === 'function') return ch.send(contentObj.content ?? contentObj);
-    return null;
-  }
-  const userId = interaction.user?.id || interaction.member?.user?.id || null;
-  const perKey = userId ? `${userId}:${key}` : null;
-  if (perKey) {
-    const e = _perUserDedupe.get(perKey);
-    if (e && e > Date.now()) {
-      if (DEBUG) console.log('sendOnce blocked per-user dedupe', perKey);
-      return null;
-    }
-  }
-  let set = _sentOnce.get(interaction);
-  if (!set) { set = new Set(); _sentOnce.set(interaction, set); }
-  if (set.has(key)) return null;
-  const sent = await safeSendAndReturnMessage(interaction, contentObj);
-  if (sent !== null) {
-    try { set.add(key); } catch {}
-    if (perKey) _perUserDedupe.set(perKey, Date.now() + PER_USER_TTL_MS);
-  }
-  return sent;
-}
-
-async function safeSendAndReturnMessage(interaction, contentObj = {}) {
-  let payload = contentObj;
-  if (typeof contentObj === 'string') payload = { content: contentObj };
-
-  const sig = signatureFromPayload(payload);
-  const channelId = interaction?.channel?.id || interaction?.message?.channel?.id || null;
-
-  // If a recent matching message exists, return it (do NOT ack component interactions here)
-  if (sig && channelId) {
-    const existing = await findRegisteredMessageForSignature(sig, channelId);
-    if (existing) {
-      if (DEBUG) console.log('safeSend: found existing message for signature, returning existing.');
-      // Do NOT call deferReply/deferUpdate for component interactions (it may break showModal)
-      try {
-        if (!isComponentInteraction(interaction)) {
-          if (!interaction.replied && !interaction.deferred) {
-            if (typeof interaction.deferReply === 'function') await interaction.deferReply({ ephemeral: true }).catch(()=>{});
-          }
-        }
-      } catch {}
-      return existing;
-    }
-  }
-
-  const makeSentinel = (path) => ({ __sentinel: true, path, channelId, content: payload?.content ?? null, embeds: payload?.embeds ?? null, timestamp: Date.now() });
-
-  // Try reply -> fetchReply
-  try {
-    if (interaction && !interaction.replied && !interaction.deferred) {
-      try {
-        await interaction.reply(payload);
-        try {
-          const msg = await interaction.fetchReply();
-          if (DEBUG) console.log('safeSend: used reply -> fetched message');
-          if (sig && channelId) {
-            registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
-            await deleteRegisteredMessageBySig(sig, channelId, msg.id).catch(()=>{});
-            await deleteOtherBotMessagesSimilar(channelId, msg.id, payload?.content?.slice(0,200) ?? null).catch(()=>{});
-          }
-          return msg;
-        } catch (e) {
-          if (DEBUG) console.log('safeSend: reply succeeded but fetchReply failed', e?.message);
-          if (sig && channelId) registerSignature(sig, channelId, null, payload?.content?.slice(0,200) ?? null);
-          return makeSentinel('reply_no_fetch');
-        }
-      } catch (e) {
-        if (DEBUG) console.log('safeSend: interaction.reply failed', e?.message);
-      }
-    }
-
-    // editReply path when already deferred/replied
-    if (interaction && (interaction.deferred || interaction.replied)) {
-      try {
-        await interaction.editReply(payload);
-        try {
-          const msg = await interaction.fetchReply();
-          if (DEBUG) console.log('safeSend: used editReply -> fetched message');
-          if (sig && channelId) {
-            registerSignature(sig, channelId, msg.id, payload?.content?.slice(0,200) ?? null);
-            await deleteRegisteredMessageBySig(sig, channelId, msg.id).catch(()=>{});
-            await deleteOtherBotMessagesSimilar(channelId, msg.id, payload?.content?.slice(0,200) ?? null).catch(()=>{});
-          }
-          return msg;
-        } catch (e) {
-          if (DEBUG) console.log('safeSend: editReply succeeded but fetchReply failed', e?.message);
-          if (sig && channelId) registerSignature(sig, channelId, null, payload?.content?.slice(0,200) ?? null);
-          return makeSentinel('edit_no_fetch');
-        }
-      } catch (e) {
-        if (DEBUG) console.log('safeSend: interaction.editReply failed', e?.message);
-      }
-    }
-  } catch (err) {
-    if (DEBUG) console.log('safeSend: reply/edit threw', err?.message);
-  }
-
-  // followUp
-  try {
-    if (interaction && typeof interaction.followUp === 'function') {
-      try {
-        const foll = await interaction.followUp(payload);
-        if (DEBUG) console.log('safeSend: used followUp');
-        if (sig && channelId) {
-          if (foll && foll.id) {
-            registerSignature(sig, channelId, foll.id, payload?.content?.slice(0,200) ?? null);
-            await deleteRegisteredMessageBySig(sig, channelId, foll.id).catch(()=>{});
-            await deleteOtherBotMessagesSimilar(channelId, foll.id, payload?.content?.slice(0,200) ?? null).catch(()=>{});
-          } else registerSignature(sig, channelId, null, payload?.content?.slice(0,200) ?? null);
-        }
-        return foll ?? makeSentinel('followup_no_message');
-      } catch (e) {
-        if (DEBUG) console.log('safeSend: followUp failed', e?.message);
-      }
-    }
-  } catch (err) {
-    if (DEBUG) console.log('safeSend: followUp threw', err?.message);
-  }
-
-  // Channel fallback (only used when interaction token doesn't allow reply/followUp)
-  try {
-    const channel = interaction?.channel || interaction?.message?.channel;
-    if (channel && typeof channel.send === 'function') {
-      if (sig && channel.id) {
-        registerSignature(sig, channel.id, null, payload?.content?.slice(0,200) ?? null);
-        if (DEBUG) console.log('safeSend: pre-registered signature before channel.send');
-      }
-      let sent;
-      if (typeof payload === 'object') {
-        const sendPayload = {};
-        if (payload.content) sendPayload.content = payload.content;
-        if (payload.embeds) sendPayload.embeds = payload.embeds;
-        if (payload.components) sendPayload.components = payload.components;
-        sent = await channel.send(sendPayload.content ?? sendPayload);
-      } else {
-        sent = await channel.send(payload);
-      }
-      if (DEBUG) console.log('safeSend: used channel.send fallback');
-      if (sig && channel.id && sent?.id) registerSignature(sig, channel.id, sent.id, payload?.content?.slice(0,200) ?? null);
-      return sent;
-    }
-  } catch (err) {
-    if (DEBUG) console.log('safeSend: channel.send failed', err?.message);
-  }
-
-  return null;
-}
-
-// safe wrappers
-async function safeReply(interaction, contentObj = {}) { await safeSendAndReturnMessage(interaction, contentObj); }
 async function safeUpdate(interaction, updateObj = {}) {
   try {
-    if (interaction && typeof interaction.update === 'function') return await interaction.update(updateObj);
-    return await safeSendAndReturnMessage(interaction, updateObj);
-  } catch {
-    try { const ch = interaction?.channel || interaction?.message?.channel; if (ch) return ch.send(updateObj.content ?? updateObj); } catch {}
+    if (interaction && typeof interaction.update === 'function') {
+      return await interaction.update(updateObj);
+    }
+    // fallback to safeReply if update isn't available
+    return await safeReply(interaction, updateObj);
+  } catch (err) {
+    // fallback to channel send for Unknown interaction
+    if (err && (err.code === 10062 || err.status === 404)) {
+      try {
+        const channel = interaction?.channel || interaction?.message?.channel;
+        if (channel) {
+          const body = (typeof updateObj === 'object' && updateObj.content) ? updateObj.content : updateObj;
+          console.warn('safeUpdate: falling back to channel.send (interaction token likely expired).');
+          return await channel.send(body);
+        }
+      } catch (e) {}
+      return null;
+    }
+    throw err;
+  }
+}
+
+// Sheet lookup helper (existence guard).
+// Returns the sheet or null after replying to the interaction.
+async function getSheetOrReply(doc, title, interaction) {
+  if (!doc) {
+    try { await safeReply(interaction, { content: '❌ Google Sheets not initialized yet', ephemeral: true }); } catch (e) {}
+    return null;
+  }
+  const sheet = doc.sheetsByTitle[title];
+  if (!sheet) {
+    try { await safeReply(interaction, { content: `❌ Sheet "${title}" not found`, ephemeral: true }); } catch (e) {}
+    return null;
+  }
+  return sheet;
+}
+
+// best-effort delete helper
+async function safeDeleteMessage(msg) {
+  if (!msg) return;
+  try {
+    if (typeof msg.delete === 'function') {
+      await msg.delete().catch(() => {});
+      return;
+    }
+    if (msg.id && msg.channel) {
+      await msg.channel.messages.delete(msg.id).catch(() => {});
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+// get log channel (env BOT_LOG_CHANNEL_ID or cfg.logChannelId)
+async function getLogChannel() {
+  const id = process.env.BOT_LOG_CHANNEL_ID || (cfg && cfg.logChannelId);
+  if (!id) return null;
+  try {
+    return client.channels.cache.get(id) || await client.channels.fetch(id);
+  } catch (e) {
     return null;
   }
 }
 
-// ---------- Sheets helper ----------
-async function getSheetOrReply(doc, title, interaction) {
-  if (!doc) { try { await safeReply(interaction, { content: '❌ Google Sheets not initialized yet', ephemeral: true }); } catch {} return null; }
-  const s = doc.sheetsByTitle[title];
-  if (!s) { try { await safeReply(interaction, { content: `❌ Sheet "${title}" not found`, ephemeral: true }); } catch {} return null; }
-  return s;
-}
+/*
+  cleanupAndLog options:
+    - interaction: the Interaction object (required)
+    - userMessages: array of user Message objects to delete
+    - botMessages: array of bot Message objects to delete
+    - menuMessage: the original menu message (interaction.message or menuMessage)
+    - componentMessages: array of component messages (like select.message)
+    - logText: string to send to log channel (can include mention <@userid>)
+*/
+async function cleanupAndLog({
+  interaction,
+  userMessages = [],
+  botMessages = [],
+  menuMessage = null,
+  componentMessages = [],
+  logText = ''
+}) {
+  const all = [
+    ...userMessages.filter(Boolean),
+    ...botMessages.filter(Boolean),
+    ...(menuMessage ? [menuMessage] : []),
+    ...componentMessages.filter(Boolean),
+  ];
 
-// ---------- deletion helpers ----------
-async function safeDeleteMessage(msgOrId, channelContext = null) {
-  if (!msgOrId) return;
-  try {
-    if (typeof msgOrId.delete === 'function') { await msgOrId.delete().catch(()=>{}); return; }
-    if (msgOrId && msgOrId.__sentinel) {
-      const chId = msgOrId.channelId || channelContext?.id;
-      if (!chId) return;
-      const ch = client.channels.cache.get(chId) || await client.channels.fetch(chId).catch(()=>null);
-      if (!ch?.messages) return;
-      const recent = await ch.messages.fetch({ limit: 50 }).catch(()=>null);
-      if (!recent) return;
-      const candidates = recent.filter(m => m.author?.id === client.user?.id);
-      if (msgOrId.content) {
-        const match = candidates.find(m => (m.content||'').trim() === (msgOrId.content||'').trim());
-        if (match) { await match.delete().catch(()=>{}); try { _recentSignatures.delete(signatureFromPayload({ content: msgOrId.content })); } catch{}; return; }
-      }
-      if (msgOrId.embeds?.length) {
-        for (const m of candidates.values()) {
-          const e = m.embeds?.[0];
-          if (!e) continue;
-          if ((e.title && msgOrId.embeds[0]?.title && e.title === msgOrId.embeds[0].title) ||
-              (e.description && msgOrId.embeds[0]?.description && e.description === msgOrId.embeds[0].description)) {
-            await m.delete().catch(()=>{}); try { _recentSignatures.delete(signatureFromPayload({ embeds: msgOrId.embeds })); } catch{}; return;
-          }
-        }
-      }
-      return;
-    }
-    if (msgOrId.id && msgOrId.channel) {
-      await msgOrId.channel.messages.delete(msgOrId.id).catch(()=>{}); return;
-    }
-    if (typeof msgOrId === 'string' && channelContext) {
-      const f = await channelContext.messages.fetch(msgOrId).catch(()=>null);
-      if (f) await f.delete().catch(()=>{});
-      return;
-    }
-  } catch {}
-}
+  await Promise.all(all.map(m => safeDeleteMessage(m)));
 
-// get log channel
-async function getLogChannel() {
-  const id = process.env.BOT_LOG_CHANNEL_ID || cfg?.logChannelId;
-  if (!id) return null;
-  try { return client.channels.cache.get(id) || await client.channels.fetch(id); } catch { return null; }
-}
-
-async function cleanupAndLog({ interaction, userMessages = [], botMessages = [], menuMessage = null, componentMessages = [], logText = '' }) {
-  const channelContext = interaction?.channel || interaction?.message?.channel || null;
-  const all = [...userMessages.filter(Boolean), ...botMessages.filter(Boolean), ...(menuMessage ? [menuMessage] : []), ...componentMessages.filter(Boolean)];
-  await Promise.all(all.map(m => safeDeleteMessage(m, channelContext)));
   const logChannel = await getLogChannel();
-  if (!logChannel) { console.warn('BOT_LOG_CHANNEL_ID missing; skipping log'); return; }
+  if (!logChannel) {
+    console.warn('BOT_LOG_CHANNEL_ID not set or channel not found; skipping log send.');
+    return;
+  }
+
   try {
-    const content = (logText && typeof logText === 'string') ? `<@${interaction.user.id}> — ${logText}` : `<@${interaction.user.id}> performed an action.`;
-    await logChannel.send({ content }).catch((e)=>{ console.error('log send failed', e?.message); });
-  } catch (e) { console.error('Failed to send log:', e); }
+    const content = (logText && typeof logText === 'string')
+      ? `<@${interaction.user.id}> — ${logText}`
+      : `<@${interaction.user.id}> performed an action.`;
+    await logChannel.send({ content });
+  } catch (err) {
+    console.error('Failed to send log message:', err);
+  }
 }
 
-// --- Roblox cookie init (safe)
-(async ()=> {
+// --- Roblox cookie init ---
+(async () => {
   try {
-    if (process.env.ROBLOX_COOKIE) { await noblox.setCookie(process.env.ROBLOX_COOKIE); console.log('✅ Roblox cookie set'); }
-    else console.warn('ROBLOX_COOKIE not set; roblox features will fail');
-  } catch (err) { console.error('Roblox cookie error', err); }
+    if (process.env.ROBLOX_COOKIE) {
+      await noblox.setCookie(process.env.ROBLOX_COOKIE);
+      console.log("✅ Roblox cookie set");
+    } else {
+      console.warn("ROBLOX_COOKIE not set; roblox features will fail until provided.");
+    }
+  } catch (err) {
+    console.error("❌ Roblox cookie error:", err);
+  }
 })();
 
-// Register commands
+// Register slash commands
 const commands = [
-  new SlashCommandBuilder().setName('robloxmanager').setDescription('Roblox group management menu'),
-  new SlashCommandBuilder().setName('bgc').setDescription('Background check a Roblox user').addStringOption(opt=>opt.setName('username').setDescription('Roblox username').setRequired(true)),
-  new SlashCommandBuilder().setName('trackermanager').setDescription('Manage placements in your Google Tracker'),
-].map(c => c.toJSON());
+  new SlashCommandBuilder()
+    .setName("robloxmanager")
+    .setDescription("Roblox group management menu"),
+  new SlashCommandBuilder()
+    .setName("bgc")
+    .setDescription("Background check a Roblox user")
+    .addStringOption((opt) =>
+      opt.setName("username").setDescription("Roblox username").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("trackermanager")
+    .setDescription("Manage placements in your Google Tracker"),
+].map((cmd) => cmd.toJSON());
 
-const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-(async ()=> {
+const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+(async () => {
   try {
-    await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
-    console.log('✅ Slash commands registered');
-  } catch (e) { console.error('Command registration failed', e?.message); }
+    await rest.put(
+      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+      { body: commands }
+    );
+    console.log("✅ Slash commands registered");
+  } catch (err) {
+    console.error("❌ Command registration failed:", err);
+  }
 })();
 
-// ---------- Interaction handler ----------
-client.on('interactionCreate', async (interaction) => {
+// --- SINGLE interactionCreate handler ---
+client.on("interactionCreate", async (interaction) => {
   try {
-    // NOTE: Do NOT pre-defer component interactions (selects/buttons) because showModal requires the interaction be un-deferred.
-    // We will only defer for long-running chat commands where appropriate.
-
-    // Chat commands
+    // --- Slash commands ---
     if (interaction.isChatInputCommand()) {
-      const isAdmin = interaction.member?.permissions?.has?.(PermissionsBitField.Flags.Administrator);
-      if (!isAdmin) { await safeReply(interaction, { content: '❌ Administrator permission required.', ephemeral: true }); return; }
+      const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+      if (!isAdmin) {
+        return safeReply(interaction, { content: "❌ Administrator permission required.", ephemeral: true });
+      }
 
-      if (interaction.commandName === 'robloxmanager') {
+      // /robloxmanager
+      if (interaction.commandName === "robloxmanager") {
         const row = new ActionRowBuilder().addComponents(
           new StringSelectMenuBuilder()
             .setCustomId(`rc_action_${interaction.user.id}`)
-            .setPlaceholder('Select an action')
+            .setPlaceholder("Select an action")
             .addOptions([
-              { label: 'Change Rank', value: 'change_rank' },
-              { label: 'Kick User', value: 'kick_user' },
-              { label: 'Accept Join Request', value: 'accept_join' },
+              { label: "Change Rank", value: "change_rank" },
+              { label: "Kick User", value: "kick_user" },
+              { label: "Accept Join Request", value: "accept_join" },
             ])
         );
-        // Use sendOnce (this will reply / followUp as needed)
-        await sendOnce(interaction, 'rc_menu', { content: 'Choose an action:', components: [row] });
-        return;
+        return safeReply(interaction, { content: "Choose an action:", components: [row] });
       }
 
-      if (interaction.commandName === 'bgc') {
-        // long running -> defer early
-        try { if (!interaction.deferred && !interaction.replied) await interaction.deferReply().catch(()=>{}); } catch {}
-        const username = interaction.options.getString('username');
-        await sendOnce(interaction, 'bgc_fetching', { content: '🔎 Fetching Roblox data…' });
+      // /bgc
+      if (interaction.commandName === "bgc") {
+        const username = interaction.options.getString("username");
+        await safeReply(interaction, { content: "🔎 Fetching Roblox data…" });
         try {
-          const userRes = await fetch('https://users.roblox.com/v1/usernames/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ usernames: [username] }) });
+          const userRes = await fetch("https://users.roblox.com/v1/usernames/users", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ usernames: [username] }),
+          });
           const userJson = await userRes.json();
-          if (!userJson.data?.length) { await sendOnce(interaction, `bgc_notfound_${username}`, { content: `❌ Could not find Roblox user **${username}**` }); return; }
+          if (!userJson.data?.length) {
+            return safeReply(interaction, { content: `❌ Could not find Roblox user **${username}**` });
+          }
           const userId = userJson.data[0].id;
-          const [info, friendsJson, followersJson, followingJson, avatarJson, groupsJson] = await Promise.all([
-            fetch(`https://users.roblox.com/v1/users/${userId}`).then(r=>r.json()),
-            fetch(`https://friends.roblox.com/v1/users/${userId}/friends/count`).then(r=>r.json()),
-            fetch(`https://friends.roblox.com/v1/users/${userId}/followers/count`).then(r=>r.json()),
-            fetch(`https://friends.roblox.com/v1/users/${userId}/followings/count`).then(r=>r.json()),
-            fetch(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=150x150&format=Png&isCircular=false`).then(r=>r.json()),
-            fetch(`https://groups.roblox.com/v2/users/${userId}/groups/roles`).then(r=>r.json()),
-          ]);
+
+          const [info, friendsJson, followersJson, followingJson, invJson, avatarJson, groupsJson] =
+            await Promise.all([
+              fetch(`https://users.roblox.com/v1/users/${userId}`).then((r) => r.json()),
+              fetch(`https://friends.roblox.com/v1/users/${userId}/friends/count`).then((r) => r.json()),
+              fetch(`https://friends.roblox.com/v1/users/${userId}/followers/count`).then((r) => r.json()),
+              fetch(`https://friends.roblox.com/v1/users/${userId}/followings/count`).then((r) => r.json()),
+              fetch(`https://inventory.roblox.com/v1/users/${userId}/can-view-inventory`).then((r) => r.json()),
+              fetch(
+                `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=150x150&format=Png&isCircular=false`
+              ).then((r) => r.json()),
+              fetch(`https://groups.roblox.com/v2/users/${userId}/groups/roles`).then((r) => r.json()),
+            ]);
+
+          const friendsCount = friendsJson.count ?? 0;
+          const followersCount = followersJson.count ?? 0;
+          const followingCount = followingJson.count ?? 0;
           const avatarUrl = avatarJson.data?.[0]?.imageUrl || null;
+
           const groups = Array.isArray(groupsJson.data) ? groupsJson.data : [];
           const totalGroups = groups.length;
-          const importantGroupIds = cfg.importantGroupIds ?? [34808935,34794384,35250103,35335293,5232591,34755744];
-          const matchedKeyGroups = groups.filter(g => importantGroupIds.includes(Number(g.group.id))).map(g => `${g.group.name} — ${g.role?.name ?? 'Member'}`);
-          const embed = new EmbedBuilder()
+          const importantGroupIds = [34808935, 34794384, 35250103, 35335293, 5232591, 34755744];
+          const matchedKeyGroups = groups
+            .filter((g) => importantGroupIds.includes(Number(g.group.id)))
+            .map((g) => `${g.group.name} — ${g.role?.name ?? "Member"}`);
+
+          let embed = new EmbedBuilder()
             .setTitle(`${info.name} (@${info.displayName})`)
             .setThumbnail(avatarUrl)
-            .setDescription(info.description || 'No bio set.')
+            .setDescription(info.description || "No bio set.")
             .addFields(
-              { name: 'Roblox ID', value: String(userId), inline: true },
-              { name: 'Account Created', value: new Date(info.created).toDateString(), inline: true },
-              { name: 'Friends', value: String(friendsJson.count ?? 0), inline: true },
-              { name: 'Followers', value: String(followersJson.count ?? 0), inline: true },
-              { name: 'Following', value: String(followingJson.count ?? 0), inline: true },
-              { name: 'Total Groups', value: String(totalGroups), inline: true },
-              { name: 'Key Groups', value: matchedKeyGroups.length ? matchedKeyGroups.join('\n') : 'None', inline: false },
-            ).setColor(0x00ae86);
-          await sendOnce(interaction, `bgc_embed_${userId}`, { embeds: [embed] });
+              { name: "Roblox ID", value: String(userId), inline: true },
+              { name: "Account Created", value: new Date(info.created).toDateString(), inline: true },
+              { name: "Friends", value: String(friendsCount), inline: true },
+              { name: "Followers", value: String(followersCount), inline: true },
+              { name: "Following", value: String(followingCount), inline: true },
+              { name: "Total Groups", value: String(totalGroups), inline: true },
+              { name: "Key Groups", value: matchedKeyGroups.length ? matchedKeyGroups.join("\n") : "None", inline: false }
+            )
+            .setColor(0x00ae86);
+
+          await safeReply(interaction, { embeds: [embed] });
         } catch (err) {
-          console.error('bgc error', err);
-          await sendOnce(interaction, 'bgc_error', { content: '❌ Error fetching data.' });
+          console.error(err);
+          await safeReply(interaction, { content: "❌ Error fetching data." });
         }
-        return;
       }
 
-      if (interaction.commandName === 'trackermanager') {
+      // /trackermanager
+      if (interaction.commandName === "trackermanager") {
         const row = new ActionRowBuilder().addComponents(
           new StringSelectMenuBuilder()
             .setCustomId(`tracker_action_${interaction.user.id}`)
-            .setPlaceholder('Select a tracker action')
+            .setPlaceholder("Select a tracker action")
             .addOptions([
-              { label: 'Add Placement', value: 'add_placement' },
-              { label: 'Promote Placement', value: 'promote_placement' },
-              { label: 'Remove User', value: 'remove_user' },
+              { label: "Add Placement", value: "add_placement" },
+              { label: "Promote Placement", value: "promote_placement" },
+              { label: "Remove User", value: "remove_user" },
             ])
         );
-        await sendOnce(interaction, 'tracker_menu', { content: 'Choose a tracker action:', components: [row] });
-        return;
+        return safeReply(interaction, { content: "Choose a tracker action:", components: [row] });
       }
     }
 
-    // Component selects: DO NOT pre-defer here (showModal must be called on the original interaction)
-    if (interaction.isStringSelectMenu() && (interaction.customId.startsWith('rc_action_') || interaction.customId.startsWith('tracker_action_'))) {
-      const parts = interaction.customId.split('_'); const tail = parts[parts.length-1];
-      if (tail !== interaction.user.id) { await safeReply(interaction, { content: '❌ This menu is not for you.', ephemeral: true }); return; }
-      const value = interaction.values?.[0];
-      if (!value) { await safeReply(interaction, { content: '❌ No option selected.', ephemeral: true }); return; }
-
-      // rc menu
-      if (interaction.customId.startsWith('rc_action_')) {
-        if (value === 'change_rank') {
-          const modal = new ModalBuilder().setCustomId(`rc_modal_changeRank_${interaction.user.id}`).setTitle('Change Rank');
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('username').setLabel('Roblox username').setStyle(TextInputStyle.Short).setRequired(true)));
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('rank').setLabel('Rank name or #').setStyle(TextInputStyle.Short).setRequired(true)));
-          await interaction.showModal(modal).catch(e => { console.log('showModal failed', e?.message); safeReply(interaction, { content: '❌ Failed to show modal.', ephemeral: true }); });
-          return;
-        }
-        if (value === 'kick_user') {
-          const modal = new ModalBuilder().setCustomId(`rc_modal_kick_${interaction.user.id}`).setTitle('Kick User');
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('username').setLabel('Roblox username').setStyle(TextInputStyle.Short).setRequired(true)));
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)));
-          await interaction.showModal(modal).catch(e => { console.log('showModal failed', e?.message); safeReply(interaction, { content: '❌ Failed to show modal.', ephemeral: true }); });
-          return;
-        }
-        if (value === 'accept_join') {
-          const modal = new ModalBuilder().setCustomId(`rc_modal_accept_${interaction.user.id}`).setTitle('Accept Join Request');
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('username').setLabel('Roblox username').setStyle(TextInputStyle.Short).setRequired(true)));
-          await interaction.showModal(modal).catch(e => { console.log('showModal failed', e?.message); safeReply(interaction, { content: '❌ Failed to show modal.', ephemeral: true }); });
-          return;
-        }
+    // --- Dropdowns: tracker manager ---
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("tracker_action_")) {
+      const actionUserId = interaction.customId.split("_").at(-1);
+      if (actionUserId !== interaction.user.id) {
+        return safeReply(interaction, { content: "❌ Only the original user can use this menu.", ephemeral: true });
       }
 
-      // tracker menu
-      if (interaction.customId.startsWith('tracker_action_')) {
-        if (value === 'add_placement') {
-          const modal = new ModalBuilder().setCustomId(`tracker_modal_add_${interaction.user.id}`).setTitle('Add Placement');
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('username').setLabel('Player username').setStyle(TextInputStyle.Short).setRequired(true)));
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('placement').setLabel('Placement (e.g. Recruit)').setStyle(TextInputStyle.Short).setRequired(true)));
-          await interaction.showModal(modal).catch(e=>{ console.log('showModal failed', e?.message); safeReply(interaction,{ content:'❌ Failed to show modal.', ephemeral:true });});
-          return;
-        }
-        if (value === 'promote_placement') {
-          const modal = new ModalBuilder().setCustomId(`tracker_modal_promote_${interaction.user.id}`).setTitle('Promote Placement');
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('username').setLabel('Player username').setStyle(TextInputStyle.Short).setRequired(true)));
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('newplacement').setLabel('New placement').setStyle(TextInputStyle.Short).setRequired(true)));
-          await interaction.showModal(modal).catch(e=>{ console.log('showModal failed', e?.message); safeReply(interaction,{ content:'❌ Failed to show modal.', ephemeral:true });});
-          return;
-        }
-        if (value === 'remove_user') {
-          const modal = new ModalBuilder().setCustomId(`tracker_modal_remove_${interaction.user.id}`).setTitle('Remove from Tracker');
-          modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('username').setLabel('Player username').setStyle(TextInputStyle.Short).setRequired(true)));
-          await interaction.showModal(modal).catch(e=>{ console.log('showModal failed', e?.message); safeReply(interaction,{ content:'❌ Failed to show modal.', ephemeral:true });});
-          return;
-        }
+      const action = interaction.values[0];
+
+      // Guarded defer: try deferReply, if it fails continue and fall back to safeReply
+      let trackerDeferred = false;
+      try {
+        await interaction.deferReply({ ephemeral: true });
+        trackerDeferred = true;
+      } catch (err) {
+        console.warn("tracker select: deferReply failed — falling back to channel replies:", err?.code, err?.message);
+        // continue; safeReply will fall back to channel.send when necessary
       }
-    }
 
-    // modal submit handlers
-    if (interaction.type === InteractionType.ModalSubmit || interaction.isModalSubmit?.()) {
-      const modalId = interaction.customId;
-      if (!modalId.includes(`_${interaction.user.id}`)) { await safeReply(interaction, { content: "❌ This modal isn't for you.", ephemeral: true }); return; }
+      await safeReply(interaction, { content: `Enter the username for **${action.replace("_", " ")}**:`, components: [] });
 
-      // change rank
-      if (modalId.startsWith('rc_modal_changeRank_')) {
-        const username = interaction.fields.getTextInputValue('username').trim();
-        const rankInput = interaction.fields.getTextInputValue('rank').trim();
-        await safeReply(interaction, { content: `Processing change rank for ${username}...`, ephemeral: true });
-        let logText = '';
-        try {
-          if (!cfg.groupId) throw new Error('cfg.groupId missing');
-          const userId = await noblox.getIdFromUsername(username);
-          let rankNumber = parseInt(rankInput,10);
-          if (isNaN(rankNumber)) {
-            const roles = await noblox.getRoles(cfg.groupId);
-            const match = roles.find(r => r.name.toLowerCase() === rankInput.toLowerCase());
-            if (!match) throw new Error('Rank not found');
-            rankNumber = match.rank;
+      const filter = (m) => m.author.id === interaction.user.id;
+      const collected = await interaction.channel.awaitMessages({
+        filter,
+        max: 1,
+        time: 30000
+      });
+      if (!collected.size) {
+        return safeReply(interaction, { content: "⏳ Timed out.", components: [] });
+      }
+      const username = collected.first().content.trim();
+
+      // ---------------- ADD PLACEMENT ----------------
+      if (action === "add_placement") {
+        await safeReply(interaction, { content: `Enter two dates for **${username}** in format: XX/XX/XX XX/XX/XX` });
+
+        const dateMsg = await interaction.channel.awaitMessages({
+          filter,
+          max: 1,
+          time: 30000
+        });
+        if (!dateMsg.size) {
+          return safeReply(interaction, { content: "⏳ Timed out.", components: [] });
+        }
+
+        const [startDate, endDate] = dateMsg.first().content.trim().split(" ");
+        const recruits = await getSheetOrReply(sheetDoc, "RECRUITS", interaction);
+        if (!recruits) return;
+
+        await recruits.loadCells("E12:N32");
+
+        let inserted = false;
+        for (let row = 11; row <= 31; row++) {
+          const cell = recruits.getCell(row, 4);
+          if (!cell.value) {
+            cell.value = username;
+            recruits.getCell(row, 12).value = startDate;
+            recruits.getCell(row, 13).value = endDate;
+            await recruits.saveUpdatedCells();
+
+            await safeReply(interaction, { content: `✅ Added **${username}** to RECRUITS with dates.`, components: [] });
+
+            const botReply = await interaction.fetchReply().catch(() => null);
+            const userMsg = collected?.first ? collected.first() : null;
+            const dateMsgObj = dateMsg?.first ? dateMsg.first() : null;
+            await cleanupAndLog({
+              interaction,
+              userMessages: [userMsg, dateMsgObj],
+              botMessages: [botReply],
+              menuMessage: interaction.message,
+              logText: `Added to RECRUITS: **${username}** — ${startDate} → ${endDate}`
+            });
+
+            inserted = true;
+            break;
           }
-          await noblox.setRank(cfg.groupId, userId, rankNumber);
-          logText = `Completed: Changed rank for ${username} to ${rankInput}`;
-          await safeReply(interaction, { content: `✅ Rank changed for ${username} to ${rankInput}`, ephemeral: true });
-        } catch (err) {
-          console.error('changeRank err', err);
-          logText = `Failed: Change rank for ${username} — ${err?.message || err}`;
-          await safeReply(interaction, { content: `❌ Failed to change rank: ${err?.message || err}`, ephemeral: true });
         }
-        try {
-          const sig = signatureFromPayload({ content: 'Choose an action:' });
-          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
-          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
-        } catch {}
+        if (!inserted) {
+          return safeReply(interaction, { content: "❌ No empty slot found in RECRUITS.", components: [] });
+        }
         return;
       }
 
-      // kick
-      if (modalId.startsWith('rc_modal_kick_')) {
-        const username = interaction.fields.getTextInputValue('username').trim();
-        const reason = (interaction.fields.getTextInputValue('reason') || '').trim() || 'No reason';
-        await safeReply(interaction, { content: `Processing kick for ${username}...`, ephemeral: true });
-        let logText = '';
-        try {
-          if (!cfg.groupId) throw new Error('cfg.groupId missing');
-          const userId = await noblox.getIdFromUsername(username);
-          await noblox.exile(cfg.groupId, userId);
-          logText = `Completed: Kicked ${username} (${reason})`;
-          await safeReply(interaction, { content: `✅ Kicked ${username}`, ephemeral: true });
-        } catch (err) {
-          console.error('kick err', err);
-          logText = `Failed: Kick ${username} — ${err?.message || err}`;
-          await safeReply(interaction, { content: `❌ Failed to kick: ${err?.message || err}`, ephemeral: true });
-        }
-        try {
-          const sig = signatureFromPayload({ content: 'Choose an action:' });
-          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
-          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
-        } catch {}
-        return;
-      }
+      // ---------------- PROMOTE PLACEMENT ----------------
+      if (action === "promote_placement") {
+        const recruits = await getSheetOrReply(sheetDoc, "RECRUITS", interaction);
+        const commandos = await getSheetOrReply(sheetDoc, "COMMANDOS", interaction);
+        if (!recruits || !commandos) return;
 
-      // accept join
-      if (modalId.startsWith('rc_modal_accept_')) {
-        const username = interaction.fields.getTextInputValue('username').trim();
-        await safeReply(interaction, { content: `Processing accept join for ${username}...`, ephemeral: true });
-        let logText = '';
-        try {
-          if (!cfg.groupId) throw new Error('cfg.groupId missing');
-          const userId = await noblox.getIdFromUsername(username);
-          if (typeof noblox.handleJoinRequest === 'function') {
-            await noblox.handleJoinRequest(cfg.groupId, userId, true);
-            logText = `Completed: Accepted join for ${username}`;
-            await safeReply(interaction, { content: `✅ Accepted join for ${username}`, ephemeral: true });
-          } else {
-            await noblox.setRank(cfg.groupId, userId, 1);
-            logText = `Completed (fallback): Set rank 1 for ${username}`;
-            await safeReply(interaction, { content: `✅ Accepted (fallback) for ${username}`, ephemeral: true });
+        await recruits.loadCells("E12:N32");
+        await commandos.loadCells("E16:E28");
+
+        let foundRow = null;
+        for (let row = 11; row <= 31; row++) {
+          const cell = recruits.getCell(row, 4);
+          if (cell.value === username) {
+            foundRow = row;
+            break;
           }
-        } catch (err) {
-          console.error('accept err', err);
-          logText = `Failed: Accept ${username} — ${err?.message || err}`;
-          await safeReply(interaction, { content: `❌ Failed to accept: ${err?.message || err}`, ephemeral: true });
         }
-        try {
-          const sig = signatureFromPayload({ content: 'Choose an action:' });
-          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
-          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
-        } catch {}
+        if (!foundRow) {
+          return safeReply(interaction, { content: "❌ User not found in RECRUITS.", components: [] });
+        }
+
+        let promoted = false;
+        for (let row = 15; row <= 27; row++) {
+          const cell = commandos.getCell(row, 4);
+          if (!cell.value || cell.value === "-") {
+            cell.value = username;
+            await commandos.saveUpdatedCells();
+
+            recruits.getCell(foundRow, 4).value = "";
+            for (let col = 5; col <= 8; col++) recruits.getCell(foundRow, col).value = false;
+            recruits.getCell(foundRow, 12).value = "";
+            recruits.getCell(foundRow, 13).value = "";
+
+            await recruits.saveUpdatedCells();
+
+            await safeReply(interaction, { content: `✅ Promoted **${username}** to COMMANDOS.`, components: [] });
+            const botReply = await interaction.fetchReply().catch(() => null);
+            const userMsg = collected?.first ? collected.first() : null;
+            await cleanupAndLog({
+              interaction,
+              userMessages: [userMsg],
+              botMessages: [botReply],
+              menuMessage: interaction.message,
+              logText: `Promoted **${username}** to COMMANDOS`
+            });
+
+            promoted = true;
+            break;
+          }
+        }
+        if (!promoted) {
+          return safeReply(interaction, { content: "❌ No empty slot in COMMANDOS.", components: [] });
+        }
         return;
       }
 
-      // tracker add/promote/remove
-      if (modalId.startsWith('tracker_modal_add_')) {
-        const username = interaction.fields.getTextInputValue('username').trim();
-        const placement = interaction.fields.getTextInputValue('placement').trim();
-        await safeReply(interaction, { content: `Adding ${username} to tracker...`, ephemeral: true });
-        let logText = '';
-        try {
-          const sheet = await getSheetOrReply(sheetDoc, 'Tracker', interaction);
-          if (!sheet) throw new Error('Tracker sheet missing');
-          await sheet.addRow({ Username: username, Placement: placement, Date: new Date().toISOString() });
-          logText = `Completed: Added ${username} as ${placement}`;
-          await safeReply(interaction, { content: `✅ Added ${username} as ${placement}`, ephemeral: true });
-        } catch (err) {
-          console.error('tracker add err', err);
-          logText = `Failed: Add ${username} — ${err?.message || err}`;
-          await safeReply(interaction, { content: `❌ Failed to add: ${err?.message || err}`, ephemeral: true });
+      // ---------------- REMOVE USER ----------------
+      if (action === "remove_user") {
+        const sheets = [
+          { name: "RECRUITS", rows: [11, 31] },
+          { name: "COMMANDOS", rows: [9, 14], altRows: [16, 28] },
+          { name: "YAYAX", rows: [11, 14], altRows: [16, 25] },
+          { name: "OMEGA", rows: [11, 14], altRows: [16, 25] },
+          { name: "DELTA", rows: [11, 14], altRows: [16, 19] },
+          { name: "CLONE FORCE 99", rows: [11, 11], altRows: [13, 16] }
+        ];
+
+        let foundAnywhere = false;
+
+        for (const sheetInfo of sheets) {
+          const sheet = await getSheetOrReply(sheetDoc, sheetInfo.name, interaction);
+          if (!sheet) continue;
+
+          await sheet.loadCells("A1:Z50");
+
+          const checkRows = Array.from(
+            { length: sheetInfo.rows[1] - sheetInfo.rows[0] + 1 },
+            (_, i) => i + sheetInfo.rows[0]
+          );
+          const altRows = sheetInfo.altRows
+            ? Array.from(
+                { length: sheetInfo.altRows[1] - sheetInfo.altRows[0] + 1 },
+                (_, i) => i + sheetInfo.altRows[0]
+              )
+            : [];
+
+          for (const row of [...checkRows, ...altRows]) {
+            const cell = sheet.getCell(row, 4); // E
+            if (cell.value === username) {
+              foundAnywhere = true;
+              if (sheetInfo.name === "RECRUITS") {
+                cell.value = "";
+                sheet.getCell(row, 12).value = "";
+                sheet.getCell(row, 13).value = "";
+                for (let col = 5; col <= 8; col++) sheet.getCell(row, col).value = false;
+                await sheet.saveUpdatedCells();
+
+                await safeReply(interaction, { content: `✅ Removed **${username}** from RECRUITS.`, components: [] });
+                const botReply = await interaction.fetchReply().catch(() => null);
+                const userMsg = collected?.first ? collected.first() : null;
+                await cleanupAndLog({
+                  interaction,
+                  userMessages: [userMsg],
+                  botMessages: [botReply],
+                  menuMessage: interaction.message,
+                  logText: `Removed **${username}** from RECRUITS.`
+                });
+                return;
+              }
+
+              if (checkRows.includes(row)) {
+                cell.value = "";
+                sheet.getCell(row, 5).value = 0;
+                const formulaCell = sheet.getCell(row, 7);
+                if (formulaCell.formula) formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
+                sheet.getCell(row, 8).value = "N/A";
+                sheet.getCell(row, 9).value = "N/A";
+                sheet.getCell(row, 10).value = "N/A";
+                sheet.getCell(row, 11).value = "";
+                sheet.getCell(row, 12).value = "E";
+                await sheet.saveUpdatedCells();
+
+                await safeReply(interaction, { content: `✅ Removed **${username}** from ${sheetInfo.name}.`, components: [] });
+                const botReply = await interaction.fetchReply().catch(() => null);
+                const userMsg = collected?.first ? collected.first() : null;
+                await cleanupAndLog({
+                  interaction,
+                  userMessages: [userMsg],
+                  botMessages: [botReply],
+                  menuMessage: interaction.message,
+                  logText: `Removed **${username}** from ${sheetInfo.name}.`
+                });
+                return;
+              }
+
+              if (altRows.includes(row)) {
+                cell.value = "";
+                sheet.getCell(row, 5).value = 0;
+                if (sheetInfo.name !== "CLONE FORCE 99") {
+                  const gCell = sheet.getCell(row, 6);
+                  gCell.value = 0;
+                  try { gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' }; } catch (e) {}
+                }
+                const formulaCell = sheet.getCell(row, 7);
+                if (formulaCell.formula) formulaCell.formula = formulaCell.formula.replace(/,\s*\d+/, ",0");
+                sheet.getCell(row, 8).value = "N/A";
+                sheet.getCell(row, 9).value = "N/A";
+                sheet.getCell(row, 10).value = "N/A";
+                sheet.getCell(row, 11).value = "";
+                sheet.getCell(row, 12).value = "E";
+                await sheet.saveUpdatedCells();
+
+                await safeReply(interaction, { content: `✅ Removed **${username}** from ${sheetInfo.name}.`, components: [] });
+                const botReply = await interaction.fetchReply().catch(() => null);
+                const userMsg = collected?.first ? collected.first() : null;
+                await cleanupAndLog({
+                  interaction,
+                  userMessages: [userMsg],
+                  botMessages: [botReply],
+                  menuMessage: interaction.message,
+                  logText: `Removed **${username}** from ${sheetInfo.name}.`
+                });
+                return;
+              }
+            }
+          }
         }
-        try {
-          const sig = signatureFromPayload({ content: 'Choose a tracker action' });
-          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
-          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
-        } catch {}
-        return;
+
+        if (!foundAnywhere) {
+          return safeReply(interaction, { content: "❌ User not found in any sheet.", components: [] });
+        }
       }
 
-      if (modalId.startsWith('tracker_modal_promote_')) {
-        const username = interaction.fields.getTextInputValue('username').trim();
-        const newplacement = interaction.fields.getTextInputValue('newplacement').trim();
-        await safeReply(interaction, { content: `Promoting ${username}...`, ephemeral: true });
-        let logText = '';
-        try {
-          const sheet = await getSheetOrReply(sheetDoc, 'Tracker', interaction);
-          if (!sheet) throw new Error('Tracker sheet missing');
-          const rows = await sheet.getRows();
-          const row = rows.find(r => String(r.Username || '').toLowerCase() === username.toLowerCase());
-          if (!row) throw new Error('User not found in tracker');
-          row.Placement = newplacement;
-          row.Date = new Date().toISOString();
-          await row.save();
-          logText = `Completed: Promoted ${username} to ${newplacement}`;
-          await safeReply(interaction, { content: `✅ Promoted ${username} to ${newplacement}`, ephemeral: true });
-        } catch (err) {
-          console.error('promote err', err);
-          logText = `Failed: Promote ${username} — ${err?.message || err}`;
-          await safeReply(interaction, { content: `❌ Failed to promote: ${err?.message || err}`, ephemeral: true });
-        }
-        try {
-          const sig = signatureFromPayload({ content: 'Choose a tracker action' });
-          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
-          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
-        } catch {}
-        return;
-      }
-
-      if (modalId.startsWith('tracker_modal_remove_')) {
-        const username = interaction.fields.getTextInputValue('username').trim();
-        await safeReply(interaction, { content: `Removing ${username}...`, ephemeral: true });
-        let logText = '';
-        try {
-          const sheet = await getSheetOrReply(sheetDoc, 'Tracker', interaction);
-          if (!sheet) throw new Error('Tracker sheet missing');
-          const rows = await sheet.getRows();
-          const row = rows.find(r => String(r.Username || '').toLowerCase() === username.toLowerCase());
-          if (!row) throw new Error('User not found in tracker');
-          await row.delete();
-          logText = `Completed: Removed ${username}`;
-          await safeReply(interaction, { content: `✅ Removed ${username} from tracker`, ephemeral: true });
-        } catch (err) {
-          console.error('remove err', err);
-          logText = `Failed: Remove ${username} — ${err?.message || err}`;
-          await safeReply(interaction, { content: `❌ Failed to remove: ${err?.message || err}`, ephemeral: true });
-        }
-        try {
-          const sig = signatureFromPayload({ content: 'Choose a tracker action' });
-          const menuMsg = await findRegisteredMessageForSignature(sig, interaction.channelId);
-          await cleanupAndLog({ interaction, menuMessage: menuMsg, logText });
-        } catch {}
-        return;
-      }
+      await safeReply(interaction, { content: `⚠️ Action **${action}** not yet implemented.`, components: [] });
     }
 
+    // --- Dropdowns: roblox manager ---
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rc_action_")) {
+      const actionUserId = interaction.customId.split("_").at(-1);
+      if (actionUserId !== interaction.user.id) {
+        return safeReply(interaction, { content: "❌ Only the original user can use this menu.", ephemeral: true });
+      }
+
+      const isAdmin = interaction.member?.permissions?.has(PermissionsBitField.Flags.Administrator);
+      if (!isAdmin) {
+        return safeReply(interaction, { content: "❌ Administrator permission required.", ephemeral: true });
+      }
+
+      const action = interaction.values[0];
+      const groupId = 35335293;
+
+      // Guarded defer: try deferReply; if it fails attempt deferUpdate, else continue
+      let rcDeferred = false;
+      try {
+        await interaction.deferReply();
+        rcDeferred = true;
+      } catch (err) {
+        console.warn("rc_action_: deferReply failed — trying deferUpdate or falling back:", err?.code, err?.message);
+        try {
+          if (typeof interaction.deferUpdate === 'function') {
+            await interaction.deferUpdate();
+            rcDeferred = true;
+          }
+        } catch (err2) {
+          console.warn("rc_action_: deferUpdate also failed:", err2?.code, err2?.message);
+        }
+      }
+
+      const menuMessage = interaction.message;
+
+      // ---------------- CHANGE RANK ----------------
+      if (action === "change_rank") {
+        await safeReply(interaction, { content: "👤 Please enter the Roblox username to change rank:" });
+        const msgCollected = await interaction.channel.awaitMessages({
+          filter: (m) => m.author.id === interaction.user.id,
+          max: 1,
+          time: 30000,
+        });
+        if (!msgCollected.size) {
+          return safeReply(interaction, { content: "⏳ Timed out waiting for username." });
+        }
+        const username = msgCollected.first().content.trim();
+
+        await safeReply(interaction, { content: `🔎 Fetching roles for **${username}**…` });
+        const roles = await noblox.getRoles(groupId);
+
+        const options = roles.slice(0, 25).map((r) => ({
+          label: `${r.name} (Rank ${r.rank})`,
+          value: JSON.stringify({ rank: r.rank, username }),
+        }));
+
+        const row = new ActionRowBuilder().addComponents(
+          new StringSelectMenuBuilder()
+            .setCustomId(`rank_select_${interaction.user.id}`)
+            .setPlaceholder("Select a new rank")
+            .addOptions(options)
+        );
+
+        await safeReply(interaction, { content: `Select the new rank for **${username}**:`, components: [row] });
+
+        const select = await interaction.channel.awaitMessageComponent({
+          filter: (i) =>
+            i.customId === `rank_select_${interaction.user.id}` &&
+            i.user.id === interaction.user.id,
+          time: 30000,
+        });
+
+        const { rank, username: uname } = JSON.parse(select.values[0]);
+        await select.deferUpdate();
+
+        await safeReply(interaction, { content: `🔧 Changing rank for **${uname}** to ${rank}…` });
+
+        try {
+          const userId = await noblox.getIdFromUsername(uname);
+          const currentRank = await noblox.getRankInGroup(groupId, userId);
+          await noblox.setRank(groupId, userId, rank);
+
+          await safeReply(interaction, { content: `✅ Rank changed for **${uname}** (ID: ${userId}) — ${currentRank} ➝ ${rank}.` });
+
+          const botReply = await interaction.fetchReply().catch(() => null);
+          const userMsg = (typeof msgCollected?.first === 'function') ? msgCollected.first() : null;
+          const componentMsg = select?.message ?? null;
+
+          await cleanupAndLog({
+           interaction,
+           userMessages: [userMsg],
+           botMessages: [botReply],
+           menuMessage,
+           componentMessages: [componentMsg],
+           logText: `Rank changed for **${uname}** (ID: ${userId}) — ${currentRank} ➝ ${rank}.`
+          });
+
+          return;
+        } catch (err) {
+          console.error("Rank change error:", err);
+          return safeReply(interaction, { content: "❌ Failed to change rank.", components: [] });
+        }
+      }
+
+      // ---------------- KICK USER ----------------
+      if (action === "kick_user") {
+        await safeReply(interaction, { content: "👤 Enter the Roblox username to kick (exile):" });
+        const msgCollected = await interaction.channel.awaitMessages({
+          filter: (m) => m.author.id === interaction.user.id,
+          max: 1,
+          time: 30000,
+        });
+
+        if (!msgCollected.size) {
+          return safeReply(interaction, { content: "⏳ Timed out waiting for username." });
+        }
+
+        const username = msgCollected.first().content.trim();
+        await safeReply(interaction, { content: `🪓 Exiling **${username}**…` });
+
+        try {
+          const userId = await noblox.getIdFromUsername(username);
+          await noblox.exile(groupId, userId);
+
+          await safeReply(interaction, { content: `✅ Exiled **${username}** (ID: ${userId}).` });
+
+          const botReply = await interaction.fetchReply().catch(() => null);
+          const userMsg = msgCollected.first();
+
+          await cleanupAndLog({
+            interaction,
+            userMessages: [userMsg],
+            botMessages: [botReply],
+            menuMessage,
+            componentMessages: [],
+            logText: `Exiled **${username}** (ID: ${userId}).`
+          });
+
+          return;
+        } catch (err) {
+          console.error("Exile error:", err);
+          return safeReply(interaction, { content: "❌ Failed to exile user." });
+        }
+      }
+
+      // ---------------- ACCEPT JOIN ----------------
+      if (action === "accept_join") {
+        await safeReply(interaction, { content: "👤 Enter the Roblox username to accept join request:" });
+        const msgCollected = await interaction.channel.awaitMessages({
+          filter: (m) => m.author.id === interaction.user.id,
+          max: 1,
+          time: 30000,
+        });
+
+        if (!msgCollected.size) {
+          return safeReply(interaction, { content: "⏳ Timed out waiting for username." });
+        }
+
+        const username = msgCollected.first().content.trim();
+        await safeReply(interaction, { content: `✅ Accepting join request for **${username}**…` });
+
+        try {
+          const userId = await noblox.getIdFromUsername(username);
+          await noblox.handleJoinRequest(groupId, userId, true);
+
+          await safeReply(interaction, { content: `✅ Accepted join request for **${username}** (ID: ${userId}).` });
+
+          const botReply = await interaction.fetchReply().catch(() => null);
+          const userMsg = msgCollected.first();
+
+          await cleanupAndLog({
+            interaction,
+            userMessages: [userMsg],
+            botMessages: [botReply],
+            menuMessage,
+            componentMessages: [],
+            logText: `Accepted join request for **${username}** (ID: ${userId}).`
+          });
+
+          return;
+        } catch (err) {
+          console.error("Accept join error:", err);
+          return safeReply(interaction, { content: "❌ Failed to accept join request." });
+        }
+      }
+    }
   } catch (err) {
-    console.error('Unhandled interaction error', err);
+    console.error("Unhandled interaction error:", err);
     try {
-      if (interaction && !interaction.replied && !interaction.deferred) await safeSendAndReturnMessage(interaction, { content: '❌ Internal error', ephemeral: true });
-    } catch {}
+      if (interaction && !interaction.replied && !interaction.deferred) {
+        await safeReply(interaction, { content: "❌ An internal error occurred.", ephemeral: true });
+      } else if (interaction && (interaction.replied || interaction.deferred)) {
+        await safeReply(interaction, { content: "❌ An internal error occurred.", components: [] });
+      }
+    } catch (e) {
+      // ignore
+    }
   }
 });
 
-// --- Sheets init ---
+// --- Google Sheets init (single, authoritative) ---
 const { GoogleAuth } = require('google-auth-library');
 async function initSheets() {
-  if (!process.env.GOOGLE_CLIENT_EMAIL || !process.env.GOOGLE_PRIVATE_KEY || !process.env.SPREADSHEET_ID) { console.warn('Sheets creds missing; skipping'); return null; }
+  if (!process.env.GOOGLE_CLIENT_EMAIL || !process.env.GOOGLE_PRIVATE_KEY || !process.env.SPREADSHEET_ID) {
+    console.warn("Google Sheets credentials or SPREADSHEET_ID missing; skipping initSheets.");
+    return null;
+  }
   let privateKey = process.env.GOOGLE_PRIVATE_KEY;
-  try { privateKey = privateKey.replace(/\\n/g, '\n'); } catch {}
-  const auth = new GoogleAuth({ credentials: { client_email: process.env.GOOGLE_CLIENT_EMAIL, private_key: privateKey }, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+  try {
+    privateKey = privateKey.replace(/\\n/g, '\n');
+  } catch (e) {
+    // leave as-is
+  }
+
+  const auth = new GoogleAuth({
+    credentials: {
+      client_email: process.env.GOOGLE_CLIENT_EMAIL,
+      private_key: privateKey,
+    },
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+
   const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, auth);
   await doc.loadInfo();
-  sheetDoc = doc;
   console.log('✅ Google Sheets connected:', doc.title);
+  sheetDoc = doc;
   return doc;
 }
 
-// startup
-(async ()=> {
+// --- Startup sequence ---
+(async () => {
   try {
     await initSheets();
     await client.login(process.env.DISCORD_TOKEN);
-  } catch (e) { console.error('Startup error', e); }
+  } catch (err) {
+    console.error('❌ Startup error:', err);
+  }
 })();
 
-client.on('error', (e) => console.error('Discord client error', e));
-process.on('unhandledRejection', (r) => console.error('Unhandled Rejection:', r));
-process.on('uncaughtException', (e) => console.error('Uncaught Exception:', e));
+// Optional: basic error handlers
+client.on('error', (err) => {
+  console.error('Discord client error:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
