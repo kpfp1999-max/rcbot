@@ -1,3 +1,4 @@
+// ...existing code...
 // Full corrected bot.js — guarded defers, robust send helpers, send-once prevention, safer deletes.
 
 const cfg = require('./config');
@@ -60,6 +61,7 @@ async function safeGetCell(sheet, row, col) {
 // WeakMap to avoid sending the same logical response twice for an interaction
 const _sentOnce = new WeakMap();
 // sendOnce ensures a response with the same key isn't sent twice for the same interaction
+// NOTE: will only mark the key as sent if a send actually succeeded (prevents false-positive marking)
 async function sendOnce(interaction, key, contentObj) {
   if (!interaction) {
     // if no interaction, just send to channel if possible
@@ -75,8 +77,16 @@ async function sendOnce(interaction, key, contentObj) {
     _sentOnce.set(interaction, set);
   }
   if (set.has(key)) return null;
-  set.add(key);
-  return safeSendAndReturnMessage(interaction, contentObj);
+
+  // Attempt the send first; only mark as sent if we got a Message (or at least didn't error)
+  const sent = await safeSendAndReturnMessage(interaction, contentObj);
+  if (sent !== null) {
+    set.add(key);
+  } else {
+    // If we didn't get a Message, don't mark so retries/fallbacks can still try
+    // but to avoid tight loops, optionally mark after a short delay — keep simple: don't mark.
+  }
+  return sent;
 }
 
 // Tries interaction.reply/editReply -> followUp -> channel.send and returns the resulting Message where available.
@@ -94,6 +104,7 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
       try {
         return await interaction.fetchReply();
       } catch (e) {
+        // fetchReply failed but reply probably succeeded; return null but don't continue to channel.send
         return null;
       }
     }
@@ -107,7 +118,7 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
           return null;
         }
       } catch (e) {
-        // editReply might fail if token is invalid
+        // editReply might fail if token is invalid, fall through to followUp/channel.send
       }
     }
   } catch (err) {
@@ -129,8 +140,19 @@ async function safeSendAndReturnMessage(interaction, contentObj = {}) {
   try {
     const channel = interaction?.channel || interaction?.message?.channel;
     if (channel && typeof channel.send === 'function') {
-      const sent = await channel.send(payload.content ?? payload);
-      return sent;
+      // If payload is an object, prefer sending payload as-is when supported
+      if (typeof payload === 'object') {
+        const sendPayload = {};
+        if (payload.content) sendPayload.content = payload.content;
+        if (payload.embeds) sendPayload.embeds = payload.embeds;
+        // components rarely meaningful in fallback, but include if present
+        if (payload.components) sendPayload.components = payload.components;
+        const sent = await channel.send(sendPayload.content ?? sendPayload);
+        return sent;
+      } else {
+        const sent = await channel.send(payload);
+        return sent;
+      }
     }
   } catch (err) {
     // can't do anything
@@ -325,13 +347,14 @@ client.on("interactionCreate", async (interaction) => {
               { label: "Accept Join Request", value: "accept_join" },
             ])
         );
-        await safeSendAndReturnMessage(interaction, { content: "Choose an action:", components: [row] });
+        // Use sendOnce to avoid duplicates
+        await sendOnce(interaction, 'rc_menu', { content: "Choose an action:", components: [row] });
         return;
       }
 
       if (interaction.commandName === "bgc") {
         const username = interaction.options.getString("username");
-        await safeSendAndReturnMessage(interaction, { content: "🔎 Fetching Roblox data…" });
+        await sendOnce(interaction, 'bgc_fetching', { content: "🔎 Fetching Roblox data…" });
         try {
           const userRes = await fetch("https://users.roblox.com/v1/usernames/users", {
             method: "POST",
@@ -340,7 +363,7 @@ client.on("interactionCreate", async (interaction) => {
           });
           const userJson = await userRes.json();
           if (!userJson.data?.length) {
-            await safeSendAndReturnMessage(interaction, { content: `❌ Could not find Roblox user **${username}**` });
+            await sendOnce(interaction, `bgc_notfound_${username}`, { content: `❌ Could not find Roblox user **${username}**` });
             return;
           }
           const userId = userJson.data[0].id;
@@ -385,10 +408,10 @@ client.on("interactionCreate", async (interaction) => {
             )
             .setColor(0x00ae86);
 
-          await safeSendAndReturnMessage(interaction, { embeds: [embed] });
+          await sendOnce(interaction, `bgc_embed_${userId}`, { embeds: [embed] });
         } catch (err) {
           console.error(err);
-          await safeSendAndReturnMessage(interaction, { content: "❌ Error fetching data." });
+          await sendOnce(interaction, 'bgc_error', { content: "❌ Error fetching data." });
         }
         return;
       }
@@ -404,7 +427,7 @@ client.on("interactionCreate", async (interaction) => {
               { label: "Remove User", value: "remove_user" },
             ])
         );
-        await safeSendAndReturnMessage(interaction, { content: "Choose a tracker action:", components: [row] });
+        await sendOnce(interaction, 'tracker_menu', { content: "Choose a tracker action:", components: [row] });
         return;
       }
     }
@@ -413,7 +436,7 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("tracker_action_")) {
       const actionUserId = interaction.customId.split("_").at(-1);
       if (actionUserId !== interaction.user.id) {
-        await safeSendAndReturnMessage(interaction, { content: "❌ Only the original user can use this menu.", ephemeral: true });
+        await sendOnce(interaction, `tracker_forbidden_${interaction.user.id}`, { content: "❌ Only the original user can use this menu.", ephemeral: true });
         return;
       }
 
@@ -666,13 +689,13 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rc_action_")) {
       const actionUserId = interaction.customId.split("_").at(-1);
       if (actionUserId !== interaction.user.id) {
-        await safeSendAndReturnMessage(interaction, { content: "❌ Only the original user can use this menu.", ephemeral: true });
+        await sendOnce(interaction, `rc_forbidden_${interaction.user.id}`, { content: "❌ Only the original user can use this menu.", ephemeral: true });
         return;
       }
 
       const isAdmin = interaction.member?.permissions?.has(PermissionsBitField.Flags.Administrator);
       if (!isAdmin) {
-        await safeSendAndReturnMessage(interaction, { content: "❌ Administrator permission required.", ephemeral: true });
+        await sendOnce(interaction, `rc_noadmin_${interaction.user.id}`, { content: "❌ Administrator permission required.", ephemeral: true });
         return;
       }
 
@@ -708,7 +731,7 @@ client.on("interactionCreate", async (interaction) => {
         }
         const username = msgCollected.first().content.trim();
 
-        await safeSendAndReturnMessage(interaction, { content: `🔎 Fetching roles for **${username}**…` });
+        await sendOnce(interaction, `rc_fetch_roles_${username}`, { content: `🔎 Fetching roles for **${username}**…` });
         const roles = await noblox.getRoles(groupId);
         const options = roles.slice(0, 25).map((r) => ({ label: `${r.name} (Rank ${r.rank})`, value: JSON.stringify({ rank: r.rank, username }) }));
 
@@ -719,7 +742,7 @@ client.on("interactionCreate", async (interaction) => {
             .addOptions(options)
         );
 
-        const selectMsg = await safeSendAndReturnMessage(interaction, { content: `Select the new rank for **${username}**:`, components: [row] });
+        const selectMsg = await sendOnce(interaction, `rank_select_msg_${interaction.user.id}_${username}`, { content: `Select the new rank for **${username}**:`, components: [row] });
 
         const select = await interaction.channel.awaitMessageComponent({
           filter: (i) => i.customId === `rank_select_${interaction.user.id}` && i.user.id === interaction.user.id,
@@ -729,14 +752,14 @@ client.on("interactionCreate", async (interaction) => {
         const { rank, username: uname } = JSON.parse(select.values[0]);
         await select.deferUpdate();
 
-        const botReply = await safeSendAndReturnMessage(interaction, { content: `🔧 Changing rank for **${uname}** to ${rank}…` });
+        const botReply = await sendOnce(interaction, `rc_changing_${uname}_${rank}`, { content: `🔧 Changing rank for **${uname}** to ${rank}…` });
 
         try {
           const userId = await noblox.getIdFromUsername(uname);
           const currentRank = await noblox.getRankInGroup(groupId, userId);
           await noblox.setRank(groupId, userId, rank);
 
-          const finalMsg = await safeSendAndReturnMessage(interaction, { content: `✅ Rank changed for **${uname}** (ID: ${userId}) — ${currentRank} ➝ ${rank}.` });
+          const finalMsg = await sendOnce(interaction, `rc_changed_${userId}_${rank}`, { content: `✅ Rank changed for **${uname}** (ID: ${userId}) — ${currentRank} ➝ ${rank}.` });
 
           const userMsg = (typeof msgCollected?.first === 'function') ? msgCollected.first() : null;
           const componentMsg = select?.message ?? null;
@@ -752,7 +775,7 @@ client.on("interactionCreate", async (interaction) => {
           return;
         } catch (err) {
           console.error("Rank change error:", err);
-          await safeSendAndReturnMessage(interaction, { content: "❌ Failed to change rank.", components: [] });
+          await sendOnce(interaction, 'rc_change_failed', { content: "❌ Failed to change rank.", components: [] });
           return;
         }
       }
@@ -767,12 +790,12 @@ client.on("interactionCreate", async (interaction) => {
         }
         const username = msgCollected.first().content.trim();
 
-        await safeSendAndReturnMessage(interaction, { content: `🪓 Exiling **${username}**…` });
+        await sendOnce(interaction, `rc_exiling_${username}`, { content: `🪓 Exiling **${username}**…` });
         try {
           const userId = await noblox.getIdFromUsername(username);
           await noblox.exile(groupId, userId);
 
-          const finalMsg = await safeSendAndReturnMessage(interaction, { content: `✅ Exiled **${username}** (ID: ${userId}).` });
+          const finalMsg = await sendOnce(interaction, `rc_exiled_${username}_${userId}`, { content: `✅ Exiled **${username}** (ID: ${userId}).` });
           const userMsg = msgCollected.first();
           await cleanupAndLog({
             interaction,
@@ -785,7 +808,7 @@ client.on("interactionCreate", async (interaction) => {
           return;
         } catch (err) {
           console.error("Exile error:", err);
-          await safeSendAndReturnMessage(interaction, { content: "❌ Failed to exile user." });
+          await sendOnce(interaction, 'rc_exile_failed', { content: "❌ Failed to exile user." });
           return;
         }
       }
@@ -800,12 +823,12 @@ client.on("interactionCreate", async (interaction) => {
         }
         const username = msgCollected.first().content.trim();
 
-        await safeSendAndReturnMessage(interaction, { content: `✅ Accepting join request for **${username}**…` });
+        await sendOnce(interaction, `rc_accepting_${username}`, { content: `✅ Accepting join request for **${username}**…` });
         try {
           const userId = await noblox.getIdFromUsername(username);
           await noblox.handleJoinRequest(groupId, userId, true);
 
-          const finalMsg = await safeSendAndReturnMessage(interaction, { content: `✅ Accepted join request for **${username}** (ID: ${userId}).` });
+          const finalMsg = await sendOnce(interaction, `rc_accepted_${username}_${userId}`, { content: `✅ Accepted join request for **${username}** (ID: ${userId}).` });
           const userMsg = msgCollected.first();
           await cleanupAndLog({
             interaction,
@@ -818,13 +841,13 @@ client.on("interactionCreate", async (interaction) => {
           return;
         } catch (err) {
           console.error("Accept join error:", err);
-          await safeSendAndReturnMessage(interaction, { content: "❌ Failed to accept join request." });
+          await sendOnce(interaction, 'rc_accept_failed', { content: "❌ Failed to accept join request." });
           return;
         }
       }
 
       // fallback
-      await safeSendAndReturnMessage(interaction, { content: "⚠️ Action not handled.", components: [] });
+      await sendOnce(interaction, 'rc_not_handled', { content: "⚠️ Action not handled.", components: [] });
     }
   } catch (err) {
     console.error("Unhandled interaction error:", err);
