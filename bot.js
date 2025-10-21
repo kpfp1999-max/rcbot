@@ -1,4 +1,4 @@
-// bot.js
+// Updated bot.js — safeReply added; tracker select uses defer+edit to avoid Unknown interaction.
 
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -140,6 +140,30 @@ async function confirm(interaction, msg) {
     }
   }
   return interaction.reply({ content: msg, components: [] });
+}
+
+// safeReply: robust reply/edit/fallback to avoid "Unknown interaction"
+async function safeReply(interaction, contentObj = {}) {
+  try {
+    if (!interaction.replied && !interaction.deferred) {
+      return await interaction.reply(contentObj);
+    }
+    // prefer editReply if we've deferred or already replied
+    return await interaction.editReply(contentObj);
+  } catch (err) {
+    try {
+      // fallback to followUp
+      return await interaction.followUp(contentObj);
+    } catch (err2) {
+      // last resort: post to channel (non-ephemeral)
+      try {
+        if (interaction.channel) return await interaction.channel.send(contentObj.content || contentObj);
+      } catch (err3) {
+        // nothing left to do
+        return null;
+      }
+    }
+  }
 }
 
 // best-effort delete helper
@@ -373,8 +397,11 @@ client.on("interactionCreate", async (interaction) => {
 
       const action = interaction.values[0];
 
-      // Update the menu message to ask for username
-      await interaction.update({
+      // --- IMPORTANT CHANGE ---
+      // We will wait for additional messages from the user. Defer the interaction
+      // to avoid "Unknown interaction" when taking >3s to collect messages.
+      await interaction.deferReply({ ephemeral: true });
+      await interaction.editReply({
         content: `Enter the username for **${action.replace("_", " ")}**:`,
         components: []
       });
@@ -386,7 +413,7 @@ client.on("interactionCreate", async (interaction) => {
         time: 30000
       });
       if (!collected.size) {
-        return interaction.editReply({ content: "⏳ Timed out." });
+        return safeReply(interaction, { content: "⏳ Timed out.", components: [] });
       }
       const username = collected.first().content.trim();
 
@@ -402,7 +429,7 @@ client.on("interactionCreate", async (interaction) => {
           time: 30000
         });
         if (!dateMsg.size) {
-          return interaction.editReply({ content: "⏳ Timed out." });
+          return safeReply(interaction, { content: "⏳ Timed out.", components: [] });
         }
 
         const [startDate, endDate] = dateMsg.first().content.trim().split(" ");
@@ -441,9 +468,7 @@ client.on("interactionCreate", async (interaction) => {
           }
         }
         if (!inserted) {
-          return interaction.editReply({
-            content: "❌ No empty slot found in RECRUITS."
-          });
+          return safeReply(interaction, { content: "❌ No empty slot found in RECRUITS.", components: [] });
         }
         return;
       }
@@ -466,7 +491,7 @@ client.on("interactionCreate", async (interaction) => {
           }
         }
         if (!foundRow) {
-          return interaction.editReply({ content: "❌ User not found in RECRUITS." });
+          return safeReply(interaction, { content: "❌ User not found in RECRUITS.", components: [] });
         }
 
         let promoted = false;
@@ -502,7 +527,7 @@ client.on("interactionCreate", async (interaction) => {
           }
         }
         if (!promoted) {
-          return interaction.editReply({ content: "❌ No empty slot in COMMANDOS." });
+          return safeReply(interaction, { content: "❌ No empty slot in COMMANDOS.", components: [] });
         }
         return;
       }
@@ -612,8 +637,7 @@ client.on("interactionCreate", async (interaction) => {
                   try {
                     gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
                   } catch (e) {
-                    // some versions of google-spreadsheet expect userEnteredFormat,
-                    // but the typical { type, pattern } works; ignore if API rejects here.
+                    // ignore if API doesn't accept this property
                   }
                 }
 
@@ -648,7 +672,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         if (!foundAnywhere) {
-          return interaction.editReply({ content: "❌ User not found in any sheet." });
+          return safeReply(interaction, { content: "❌ User not found in any sheet.", components: [] });
         }
       }
 
