@@ -1,4 +1,4 @@
-// Updated bot.js — safeReply added; tracker select uses defer+edit to avoid Unknown interaction.
+// Updated: robust safeReply/safeUpdate wrappers to avoid "Unknown interaction" errors.
 
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -60,27 +60,15 @@ async function safeGetCell(sheet, row, col) {
 async function getSheetOrReply(doc, title, interaction) {
   if (!doc) {
     try {
-      if (!interaction.deferred && !interaction.replied) {
-        await interaction.reply({ content: '❌ Google Sheets not initialized yet', ephemeral: true });
-      } else {
-        await interaction.followUp({ content: '❌ Google Sheets not initialized yet', ephemeral: true });
-      }
-    } catch (e) {
-      // ignore
-    }
+      await safeReply(interaction, { content: '❌ Google Sheets not initialized yet', ephemeral: true });
+    } catch (e) {}
     return null;
   }
   const sheet = doc.sheetsByTitle[title];
   if (!sheet) {
     try {
-      if (!interaction.deferred && !interaction.replied) {
-        await interaction.reply({ content: `❌ Sheet "${title}" not found`, ephemeral: true });
-      } else {
-        await interaction.followUp({ content: `❌ Sheet "${title}" not found`, ephemeral: true });
-      }
-    } catch (e) {
-      // ignore
-    }
+      await safeReply(interaction, { content: `❌ Sheet "${title}" not found`, ephemeral: true });
+    } catch (e) {}
     return null;
   }
   return sheet;
@@ -130,39 +118,65 @@ const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 })();
 
 // Helper for safe replies (reply vs editReply)
+// kept for compatibility; safeReply below is preferred for robust flows
 async function confirm(interaction, msg) {
-  if (interaction.replied || interaction.deferred) {
-    try {
-      return await interaction.editReply({ content: msg, components: [] });
-    } catch (e) {
-      // fallback to followUp if editReply fails
-      try { return await interaction.followUp({ content: msg }); } catch (e2) { return null; }
-    }
-  }
-  return interaction.reply({ content: msg, components: [] });
+  return safeReply(interaction, { content: msg });
 }
 
 // safeReply: robust reply/edit/fallback to avoid "Unknown interaction"
 async function safeReply(interaction, contentObj = {}) {
   try {
+    // keep behavior: if not replied and not deferred, try reply()
     if (!interaction.replied && !interaction.deferred) {
       return await interaction.reply(contentObj);
     }
     // prefer editReply if we've deferred or already replied
     return await interaction.editReply(contentObj);
   } catch (err) {
+    // If the interaction is unknown or expired, try followUp, then channel fallback
     try {
-      // fallback to followUp
       return await interaction.followUp(contentObj);
     } catch (err2) {
-      // last resort: post to channel (non-ephemeral)
       try {
-        if (interaction.channel) return await interaction.channel.send(contentObj.content || contentObj);
+        const channel = interaction.channel || (interaction.message && interaction.message.channel);
+        if (channel) {
+          // if contentObj is an object with content, send that; otherwise try to send the string directly
+          const body = (typeof contentObj === 'object' && contentObj.content) ? contentObj.content : contentObj;
+          return await channel.send(body);
+        }
       } catch (err3) {
-        // nothing left to do
+        // last resort: nothing to do
         return null;
       }
     }
+  }
+}
+
+// safeUpdate: for component interactions where update() is intended.
+// If update fails (Unknown interaction) this will fallback to channel send.
+async function safeUpdate(interaction, updateObj = {}) {
+  try {
+    if (typeof interaction.update === 'function') {
+      return await interaction.update(updateObj);
+    }
+    // If no update function (not a component), fallback to safeReply
+    return await safeReply(interaction, updateObj);
+  } catch (err) {
+    // If Discord says Unknown interaction -> fallback to channel send
+    if (err && (err.code === 10062 || err.status === 404)) {
+      try {
+        const channel = interaction.channel || (interaction.message && interaction.message.channel);
+        if (channel) {
+          const body = (typeof updateObj === 'object' && updateObj.content) ? updateObj.content : updateObj;
+          return await channel.send(body);
+        }
+      } catch (e) {
+        // ignore
+      }
+      return null;
+    }
+    // otherwise rethrow so calling code can handle
+    throw err;
   }
 }
 
@@ -231,7 +245,6 @@ async function cleanupAndLog({
   }
 
   try {
-    // keep it simple: ping the user who ran it and include details
     const content = (logText && typeof logText === 'string')
       ? `<@${interaction.user.id}> — ${logText}`
       : `<@${interaction.user.id}> performed an action.`;
@@ -251,10 +264,7 @@ client.on("interactionCreate", async (interaction) => {
         PermissionsBitField.Flags.Administrator
       );
       if (!isAdmin) {
-        return interaction.reply({
-          content: "❌ Administrator permission required.",
-          ephemeral: true,
-        });
+        return safeReply(interaction, { content: "❌ Administrator permission required.", ephemeral: true });
       }
 
       // /robloxmanager
@@ -269,13 +279,13 @@ client.on("interactionCreate", async (interaction) => {
               { label: "Accept Join Request", value: "accept_join" },
             ])
         );
-        return interaction.reply({ content: "Choose an action:", components: [row] });
+        return safeReply(interaction, { content: "Choose an action:", components: [row] });
       }
 
       // /bgc
       if (interaction.commandName === "bgc") {
         const username = interaction.options.getString("username");
-        await interaction.reply({ content: "🔎 Fetching Roblox data…" });
+        await safeReply(interaction, { content: "🔎 Fetching Roblox data…" });
         try {
           const userRes = await fetch("https://users.roblox.com/v1/usernames/users", {
             method: "POST",
@@ -284,7 +294,7 @@ client.on("interactionCreate", async (interaction) => {
           });
           const userJson = await userRes.json();
           if (!userJson.data?.length) {
-            return interaction.editReply(`❌ Could not find Roblox user **${username}**`);
+            return safeReply(interaction, { content: `❌ Could not find Roblox user **${username}**` });
           }
           const userId = userJson.data[0].id;
 
@@ -362,10 +372,10 @@ client.on("interactionCreate", async (interaction) => {
               .setURL(`https://www.roblox.com/users/${userId}/inventory/#!/badges`)
           );
 
-          await interaction.editReply({ embeds: [embed], components: [badgeRow] });
+          await safeReply(interaction, { embeds: [embed], components: [badgeRow] });
         } catch (err) {
           console.error(err);
-          await interaction.editReply("❌ Error fetching data.");
+          await safeReply(interaction, { content: "❌ Error fetching data." });
         }
       }
 
@@ -381,7 +391,7 @@ client.on("interactionCreate", async (interaction) => {
               { label: "Remove User", value: "remove_user" },
             ])
         );
-        return interaction.reply({ content: "Choose a tracker action:", components: [row] });
+        return safeReply(interaction, { content: "Choose a tracker action:", components: [row] });
       }
     }
 
@@ -389,22 +399,14 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("tracker_action_")) {
       const actionUserId = interaction.customId.split("_").at(-1);
       if (actionUserId !== interaction.user.id) {
-        return interaction.reply({
-          content: "❌ Only the original user can use this menu.",
-          ephemeral: true
-        });
+        return safeReply(interaction, { content: "❌ Only the original user can use this menu.", ephemeral: true });
       }
 
       const action = interaction.values[0];
 
-      // --- IMPORTANT CHANGE ---
-      // We will wait for additional messages from the user. Defer the interaction
-      // to avoid "Unknown interaction" when taking >3s to collect messages.
+      // We will wait → defer to avoid token expiry
       await interaction.deferReply({ ephemeral: true });
-      await interaction.editReply({
-        content: `Enter the username for **${action.replace("_", " ")}**:`,
-        components: []
-      });
+      await safeReply(interaction, { content: `Enter the username for **${action.replace("_", " ")}**:`, components: [] });
 
       const filter = (m) => m.author.id === interaction.user.id;
       const collected = await interaction.channel.awaitMessages({
@@ -419,9 +421,7 @@ client.on("interactionCreate", async (interaction) => {
 
       // ---------------- ADD PLACEMENT ----------------
       if (action === "add_placement") {
-        await interaction.editReply({
-          content: `Enter two dates for **${username}** in format: XX/XX/XX XX/XX/XX`
-        });
+        await safeReply(interaction, { content: `Enter two dates for **${username}** in format: XX/XX/XX XX/XX/XX` });
 
         const dateMsg = await interaction.channel.awaitMessages({
           filter,
@@ -447,10 +447,7 @@ client.on("interactionCreate", async (interaction) => {
             recruits.getCell(row, 13).value = endDate;   // Column N (0-index)
             await recruits.saveUpdatedCells();
 
-            await interaction.editReply({
-              content: `✅ Added **${username}** to RECRUITS with dates.`,
-              components: []
-            });
+            await safeReply(interaction, { content: `✅ Added **${username}** to RECRUITS with dates.`, components: [] });
 
             const botReply = await interaction.fetchReply().catch(() => null);
             const userMsg = collected?.first ? collected.first() : null; // username message
@@ -511,9 +508,9 @@ client.on("interactionCreate", async (interaction) => {
 
             await recruits.saveUpdatedCells();
 
-            await interaction.editReply({ content: `✅ Promoted **${username}** to COMMANDOS.`, components: [] });
+            await safeReply(interaction, { content: `✅ Promoted **${username}** to COMMANDOS.`, components: [] });
             const botReply = await interaction.fetchReply().catch(() => null);
-            const userMsg = collected?.first ? collected.first() : null; // if you collected username earlier
+            const userMsg = collected?.first ? collected.first() : null;
             await cleanupAndLog({
               interaction,
               userMessages: [userMsg],
@@ -577,10 +574,7 @@ client.on("interactionCreate", async (interaction) => {
                 }
                 await sheet.saveUpdatedCells();
 
-                await interaction.editReply({
-                  content: `✅ Removed **${username}** from RECRUITS.`,
-                  components: []
-                });
+                await safeReply(interaction, { content: `✅ Removed **${username}** from RECRUITS.`, components: [] });
                 const botReply = await interaction.fetchReply().catch(() => null);
                 const userMsg = collected?.first ? collected.first() : null;
                 await cleanupAndLog({
@@ -608,10 +602,7 @@ client.on("interactionCreate", async (interaction) => {
                 sheet.getCell(row, 12).value = "E"; // M
                 await sheet.saveUpdatedCells();
 
-                await interaction.editReply({
-                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`,
-                  components: []
-                });
+                await safeReply(interaction, { content: `✅ Removed **${username}** from ${sheetInfo.name}.`, components: [] });
                 const botReply = await interaction.fetchReply().catch(() => null);
                 const userMsg = collected?.first ? collected.first() : null;
                 await cleanupAndLog({
@@ -632,7 +623,7 @@ client.on("interactionCreate", async (interaction) => {
                 // Only update G column if NOT CLONE FORCE 99
                 if (sheetInfo.name !== "CLONE FORCE 99") {
                   const gCell = sheet.getCell(row, 6); // G
-                  // Set numeric zero to represent 12:00:00 AM and set numberFormat to TIME
+                  // Set numeric zero to represent midnight and set numberFormat to TIME
                   gCell.value = 0;
                   try {
                     gCell.numberFormat = { type: 'TIME', pattern: 'h:mm' };
@@ -652,10 +643,7 @@ client.on("interactionCreate", async (interaction) => {
                 sheet.getCell(row, 12).value = "E"; // M
                 await sheet.saveUpdatedCells();
 
-                await interaction.editReply({
-                  content: `✅ Removed **${username}** from ${sheetInfo.name}.`,
-                  components: []
-                });
+                await safeReply(interaction, { content: `✅ Removed **${username}** from ${sheetInfo.name}.`, components: [] });
                 const botReply = await interaction.fetchReply().catch(() => null);
                 const userMsg = collected?.first ? collected.first() : null;
                 await cleanupAndLog({
@@ -677,22 +665,19 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       // --- Default ---
-      await interaction.editReply({
-        content: `⚠️ Action **${action}** not yet implemented.`,
-        components: []
-      });
+      await safeReply(interaction, { content: `⚠️ Action **${action}** not yet implemented.`, components: [] });
     }
 
     // --- Dropdowns: roblox manager ---
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("rc_action_")) {
       const actionUserId = interaction.customId.split("_").at(-1);
       if (actionUserId !== interaction.user.id) {
-        return interaction.reply({ content: "❌ Only the original user can use this menu.", ephemeral: true });
+        return safeReply(interaction, { content: "❌ Only the original user can use this menu.", ephemeral: true });
       }
 
       const isAdmin = interaction.member?.permissions?.has(PermissionsBitField.Flags.Administrator);
       if (!isAdmin) {
-        return interaction.reply({ content: "❌ Administrator permission required.", ephemeral: true });
+        return safeReply(interaction, { content: "❌ Administrator permission required.", ephemeral: true });
       }
 
       const action = interaction.values[0];
@@ -702,18 +687,18 @@ client.on("interactionCreate", async (interaction) => {
 
       // ---------------- CHANGE RANK ----------------
       if (action === "change_rank") {
-        await interaction.editReply("👤 Please enter the Roblox username to change rank:");
+        await safeReply(interaction, { content: "👤 Please enter the Roblox username to change rank:" });
         const msgCollected = await interaction.channel.awaitMessages({
           filter: (m) => m.author.id === interaction.user.id,
           max: 1,
           time: 30000,
         });
         if (!msgCollected.size) {
-          return interaction.editReply("⏳ Timed out waiting for username.");
+          return safeReply(interaction, { content: "⏳ Timed out waiting for username." });
         }
         const username = msgCollected.first().content.trim();
 
-        await interaction.editReply(`🔎 Fetching roles for **${username}**…`);
+        await safeReply(interaction, { content: `🔎 Fetching roles for **${username}**…` });
         const roles = await noblox.getRoles(groupId);
 
         const options = roles.slice(0, 25).map((r) => ({
@@ -728,10 +713,7 @@ client.on("interactionCreate", async (interaction) => {
             .addOptions(options)
         );
 
-        await interaction.editReply({
-          content: `Select the new rank for **${username}**:`,
-          components: [row],
-        });
+        await safeReply(interaction, { content: `Select the new rank for **${username}**:`, components: [row] });
 
         const select = await interaction.channel.awaitMessageComponent({
           filter: (i) =>
@@ -743,32 +725,19 @@ client.on("interactionCreate", async (interaction) => {
         const { rank, username: uname } = JSON.parse(select.values[0]);
         await select.deferUpdate();
 
-        await interaction.editReply({
-          content: `🔧 Changing rank for **${uname}** to ${rank}…`,
-          components: [],
-        });
+        await safeReply(interaction, { content: `🔧 Changing rank for **${uname}** to ${rank}…` });
 
         try {
           const userId = await noblox.getIdFromUsername(uname);
           const currentRank = await noblox.getRankInGroup(groupId, userId);
           await noblox.setRank(groupId, userId, rank);
 
-          // show a brief confirmation so the user sees it
-          await interaction.editReply({
-           content: `✅ Rank changed for **${uname}** (ID: ${userId}) — ${currentRank} ➝ ${rank}.`,
-           components: [],
-          });
+          await safeReply(interaction, { content: `✅ Rank changed for **${uname}** (ID: ${userId}) — ${currentRank} ➝ ${rank}.` });
 
-          // fetch the bot reply message (so we can delete it)
           const botReply = await interaction.fetchReply().catch(() => null);
-
-          // the username message the user sent earlier (variable in this scope is msgCollected)
           const userMsg = (typeof msgCollected?.first === 'function') ? msgCollected.first() : null;
-
-          // the select component message (where the role was chosen)
           const componentMsg = select?.message ?? null;
 
-          // original menu message (declared earlier as menuMessage)
           await cleanupAndLog({
            interaction,
            userMessages: [userMsg],
@@ -781,13 +750,13 @@ client.on("interactionCreate", async (interaction) => {
           return;
         } catch (err) {
           console.error("Rank change error:", err);
-          return interaction.editReply({ content: "❌ Failed to change rank.", components: [] });
+          return safeReply(interaction, { content: "❌ Failed to change rank.", components: [] });
         }
       }
 
       // ---------------- KICK USER ----------------
       if (action === "kick_user") {
-        await interaction.editReply("👤 Enter the Roblox username to kick (exile):");
+        await safeReply(interaction, { content: "👤 Enter the Roblox username to kick (exile):" });
         const msgCollected = await interaction.channel.awaitMessages({
           filter: (m) => m.author.id === interaction.user.id,
           max: 1,
@@ -795,26 +764,21 @@ client.on("interactionCreate", async (interaction) => {
         });
 
         if (!msgCollected.size) {
-          return interaction.editReply("⏳ Timed out waiting for username.");
+          return safeReply(interaction, { content: "⏳ Timed out waiting for username." });
         }
 
         const username = msgCollected.first().content.trim();
-        await interaction.editReply(`🪓 Exiling **${username}**…`);
+        await safeReply(interaction, { content: `🪓 Exiling **${username}**…` });
 
         try {
           const userId = await noblox.getIdFromUsername(username);
           await noblox.exile(groupId, userId);
 
-          // show a brief confirmation so the user sees it
-          await interaction.editReply(`✅ Exiled **${username}** (ID: ${userId}).`);
+          await safeReply(interaction, { content: `✅ Exiled **${username}** (ID: ${userId}).` });
 
-          // fetch the bot reply message (so we can delete it)
           const botReply = await interaction.fetchReply().catch(() => null);
-
-          // the username message the user sent earlier
           const userMsg = msgCollected.first();
 
-          // cleanup and log
           await cleanupAndLog({
             interaction,
             userMessages: [userMsg],
@@ -827,13 +791,13 @@ client.on("interactionCreate", async (interaction) => {
           return;
         } catch (err) {
           console.error("Exile error:", err);
-          return interaction.editReply("❌ Failed to exile user.");
+          return safeReply(interaction, { content: "❌ Failed to exile user." });
         }
       }
 
       // ---------------- ACCEPT JOIN ----------------
       if (action === "accept_join") {
-        await interaction.editReply("👤 Enter the Roblox username to accept join request:");
+        await safeReply(interaction, { content: "👤 Enter the Roblox username to accept join request:" });
         const msgCollected = await interaction.channel.awaitMessages({
           filter: (m) => m.author.id === interaction.user.id,
           max: 1,
@@ -841,17 +805,17 @@ client.on("interactionCreate", async (interaction) => {
         });
 
         if (!msgCollected.size) {
-          return interaction.editReply("⏳ Timed out waiting for username.");
+          return safeReply(interaction, { content: "⏳ Timed out waiting for username." });
         }
 
         const username = msgCollected.first().content.trim();
-        await interaction.editReply(`✅ Accepting join request for **${username}**…`);
+        await safeReply(interaction, { content: `✅ Accepting join request for **${username}**…` });
 
         try {
           const userId = await noblox.getIdFromUsername(username);
           await noblox.handleJoinRequest(groupId, userId, true);
 
-          await interaction.editReply(`✅ Accepted join request for **${username}** (ID: ${userId}).`);
+          await safeReply(interaction, { content: `✅ Accepted join request for **${username}** (ID: ${userId}).` });
 
           const botReply = await interaction.fetchReply().catch(() => null);
           const userMsg = msgCollected.first();
@@ -868,18 +832,17 @@ client.on("interactionCreate", async (interaction) => {
           return;
         } catch (err) {
           console.error("Accept join error:", err);
-          return interaction.editReply("❌ Failed to accept join request.");
+          return safeReply(interaction, { content: "❌ Failed to accept join request." });
         }
       }
     }
   } catch (err) {
     console.error("Unhandled interaction error:", err);
-    // attempt to notify the user (best-effort)
     try {
       if (interaction && !interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: "❌ An internal error occurred.", ephemeral: true });
+        await safeReply(interaction, { content: "❌ An internal error occurred.", ephemeral: true });
       } else if (interaction && (interaction.replied || interaction.deferred)) {
-        await interaction.editReply({ content: "❌ An internal error occurred.", components: [] });
+        await safeReply(interaction, { content: "❌ An internal error occurred.", components: [] });
       }
     } catch (e) {
       // ignore
