@@ -1,5 +1,4 @@
-// ...existing code...
-// Full corrected bot.js — guarded defers, robust send helpers, send-once prevention, safer deletes.
+// Full corrected bot.js — guarded defers, robust send helpers, send-once prevention, sentinel metadata, safer deletes.
 
 const cfg = require('./config');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -60,8 +59,9 @@ async function safeGetCell(sheet, row, col) {
 
 // WeakMap to avoid sending the same logical response twice for an interaction
 const _sentOnce = new WeakMap();
+
 // sendOnce ensures a response with the same key isn't sent twice for the same interaction
-// NOTE: will only mark the key as sent if a send actually succeeded (prevents false-positive marking)
+// NOTE: will mark the key as sent only if the underlying send operation returned non-null
 async function sendOnce(interaction, key, contentObj) {
   if (!interaction) {
     // if no interaction, just send to channel if possible
@@ -78,84 +78,105 @@ async function sendOnce(interaction, key, contentObj) {
   }
   if (set.has(key)) return null;
 
-  // Attempt the send first; only mark as sent if we got a Message (or at least didn't error)
   const sent = await safeSendAndReturnMessage(interaction, contentObj);
-  if (sent !== null) {
-    set.add(key);
-  } else {
-    // If we didn't get a Message, don't mark so retries/fallbacks can still try
-    // but to avoid tight loops, optionally mark after a short delay — keep simple: don't mark.
-  }
+  if (sent !== null) set.add(key);
   return sent;
 }
 
 // Tries interaction.reply/editReply -> followUp -> channel.send and returns the resulting Message where available.
-// Also safe against Unknown interaction (10062).
+// If an interaction-based send succeeded but fetchReply failed, a sentinel metadata object is returned so cleanup can search for the actual bot message.
 async function safeSendAndReturnMessage(interaction, contentObj = {}) {
   // Normalize contentObj for channel.send fallback (allow passing a string)
   let payload = contentObj;
   if (typeof contentObj === 'string') payload = { content: contentObj };
 
+  // Helper to build metadata sentinel
+  const makeSentinel = (path) => {
+    return {
+      __sentinel: true,
+      path,
+      channelId: interaction?.channel?.id || interaction?.message?.channel?.id || null,
+      content: payload?.content ?? null,
+      embeds: payload?.embeds ?? null,
+      timestamp: Date.now(),
+    };
+  };
+
   // Try reply/editReply path first
   try {
     if (interaction && !interaction.replied && !interaction.deferred) {
-      // Use reply; then try to fetchReply to get Message object
-      await interaction.reply(payload);
       try {
-        return await interaction.fetchReply();
+        await interaction.reply(payload);
+        // reply accepted. Try to fetch the message for deletion. If fetch fails, return sentinel.
+        try {
+          const msg = await interaction.fetchReply();
+          console.debug('safeSend: used reply -> fetched message');
+          return msg;
+        } catch (e) {
+          console.debug('safeSend: reply succeeded but fetchReply failed; returning sentinel', e?.message);
+          return makeSentinel('reply_no_fetch');
+        }
       } catch (e) {
-        // fetchReply failed but reply probably succeeded; return null but don't continue to channel.send
-        return null;
+        // reply failed, fall through to other methods
+        console.debug('safeSend: interaction.reply failed, falling through:', e?.message);
       }
     }
-    // If already deferred/replied, attempt editReply
+
     if (interaction && (interaction.deferred || interaction.replied)) {
       try {
         await interaction.editReply(payload);
         try {
-          return await interaction.fetchReply();
+          const msg = await interaction.fetchReply();
+          console.debug('safeSend: used editReply -> fetched message');
+          return msg;
         } catch (e) {
-          return null;
+          console.debug('safeSend: editReply succeeded but fetchReply failed; returning sentinel', e?.message);
+          return makeSentinel('edit_no_fetch');
         }
       } catch (e) {
-        // editReply might fail if token is invalid, fall through to followUp/channel.send
+        console.debug('safeSend: interaction.editReply failed, falling through:', e?.message);
       }
     }
   } catch (err) {
     // swallow and fallback
+    console.debug('safeSend: reply/edit attempt threw, falling back:', err?.message);
   }
 
   // Try followUp()
   try {
     if (interaction && typeof interaction.followUp === 'function') {
-      const follow = await interaction.followUp(payload);
-      // followUp returns a Message in most cases
-      return follow ?? null;
+      try {
+        const follow = await interaction.followUp(payload);
+        console.debug('safeSend: used followUp');
+        return follow ?? makeSentinel('followup_no_message');
+      } catch (e) {
+        console.debug('safeSend: followUp failed, falling through:', e?.message);
+      }
     }
   } catch (err) {
-    // swallow and fallback to channel
+    console.debug('safeSend: followUp threw:', err?.message);
   }
 
   // Channel fallback: find a channel to send to
   try {
     const channel = interaction?.channel || interaction?.message?.channel;
     if (channel && typeof channel.send === 'function') {
-      // If payload is an object, prefer sending payload as-is when supported
       if (typeof payload === 'object') {
         const sendPayload = {};
         if (payload.content) sendPayload.content = payload.content;
         if (payload.embeds) sendPayload.embeds = payload.embeds;
-        // components rarely meaningful in fallback, but include if present
         if (payload.components) sendPayload.components = payload.components;
         const sent = await channel.send(sendPayload.content ?? sendPayload);
+        console.debug('safeSend: used channel.send fallback');
         return sent;
       } else {
         const sent = await channel.send(payload);
+        console.debug('safeSend: used channel.send fallback (string payload)');
         return sent;
       }
     }
   } catch (err) {
-    // can't do anything
+    console.debug('safeSend: channel.send fallback failed:', err?.message);
   }
 
   return null;
@@ -209,6 +230,53 @@ async function safeDeleteMessage(msgOrId, channelContext = null) {
       await msgOrId.delete().catch(() => {});
       return;
     }
+
+    // If it's a sentinel metadata object returned by safeSendAndReturnMessage (when fetchReply failed)
+    if (msgOrId && msgOrId.__sentinel) {
+      try {
+        const chId = msgOrId.channelId || channelContext?.id;
+        if (!chId) return;
+        const ch = client.channels.cache.get(chId) || await client.channels.fetch(chId).catch(() => null);
+        if (!ch) return;
+
+        // Discord.js v14: check for text-based channel by presence of .messages
+        const canFetch = ch?.messages && typeof ch.messages.fetch === 'function';
+        if (!canFetch) return;
+
+        // Fetch recent messages and try to find a bot message that matches content or embed title.
+        const recent = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+        if (!recent) return;
+        const candidates = recent.filter(m => m.author?.id === client.user?.id);
+
+        // Try to match by exact content first
+        if (msgOrId.content) {
+          const match = candidates.find(m => (m.content || '').trim() === (msgOrId.content || '').trim());
+          if (match) {
+            await match.delete().catch(() => {});
+            return;
+          }
+        }
+
+        // Try to match by embed content/title if available
+        if (msgOrId.embeds && msgOrId.embeds.length) {
+          for (const m of candidates.values()) {
+            const e = m.embeds?.[0];
+            if (!e) continue;
+            if ((e.title && msgOrId.embeds[0]?.title && e.title === msgOrId.embeds[0].title) ||
+                (e.description && msgOrId.embeds[0]?.description && e.description === msgOrId.embeds[0].description)) {
+              await m.delete().catch(() => {});
+              return;
+            }
+          }
+        }
+
+        // No exact match — don't delete aggressively; return.
+        return;
+      } catch (e) {
+        return;
+      }
+    }
+
     // If it's { id, channel } we can delete directly
     if (msgOrId.id && msgOrId.channel) {
       await msgOrId.channel.messages.delete(msgOrId.id).catch(() => {});
